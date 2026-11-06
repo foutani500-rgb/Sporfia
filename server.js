@@ -273,8 +273,11 @@ const PUBLIC = path.join(__dirname, "public");
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const ADMIN_PIN = process.env.ADMIN_PIN || "123456";
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
-const BOT_USERNAME = "TawaqqoArenaBot";
-const START_BALANCE = 100;
+const BOT_USERNAME = process.env.BOT_USERNAME || "TawaqqoArenaBot";
+// نسب العمولة على مبلغ كل رهان: المستوى 1 = 10% ، المستوى 2 = 5% ، المستوى 3 = 3% (قابلة للتعديل عبر REF_RATES="0.10,0.05,0.03")
+const REF_RATES = (process.env.REF_RATES || "0.10,0.05,0.03").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0).concat([0, 0, 0]).slice(0, 3);
+const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // مكافأة الداعي عن كل صديق مؤهَّل (تُمنح مرة واحدة عند التأهيل فقط)
+const START_BALANCE = Number(process.env.START_BALANCE ?? 0); // رصيد البداية: 0 افتراضياً (لا رصيد وهمي)
 const MAX_CATCHUP = 150;                 // أقصى عدد نبضات تُحسب في طلب واحد
 const ENDED_KEEP_MS = 15 * 60_000;       // المباراة المنتهية تُستبدل بجديدة بعد 15 دقيقة
 
@@ -400,7 +403,7 @@ async function adminLog(msg) {
 const newUser = (id, name = "لاعبنا", avatar = "🎯") => ({
   _id: id, name, avatar, joinedAt: Date.now(),
   balance: START_BALANCE, vipXp: 0, streak: 0, bestStreak: 0, frozen: false,
-  notices: [{ id: uid(), title: "أهلاً بك في ساحة التوقّع 🎉", body: `حسابك التجريبي جاهز برصيد $${START_BALANCE}. توقّع النتيجة الدقيقة واضرب من أول مرة!`, at: Date.now(), read: false, tone: "gold" }],
+  notices: [{ id: uid(), title: "أهلاً بك في ساحة التوقّع 🎉", body: START_BALANCE > 0 ? `حسابك جاهز برصيد $${START_BALANCE}. توقّع النتيجة الدقيقة!` : "حسابك جاهز. اشحن رصيدك وتوقّع النتيجة الدقيقة!", at: Date.now(), read: false, tone: "gold" }],
   autoDeposit: { enabled: false, threshold: 20, amount: 50, method: "ton", dailyCap: 200, depositedToday: 0, capDate: todayKey() },
   limits: { dailyLossLimit: 0, maxStake: 0, selfExcludedUntil: null },
   claimedCommission: 0, referredBy: null, lastBonusAt: 0,
@@ -649,24 +652,18 @@ async function refundBet(b, label) {
 }
 
 /* ---- لوحة الترتيب ---- */
-const BOT_NAMES = ["سلطان", "فيصل", "نورة", "ريم", "ماجد", "هشام", "طارق", "ليلى", "عمر", "سارة", "جاسم", "منى"];
-const BOT_AVATARS = ["🦅", "🐆", "🐻", "🦁", "🐺", "🦊", "🐯", "🦈"];
 async function leaderboard(limit, myId) {
   const { users } = await C();
   const real = (await users.find({}).sort({ balance: -1 }).limit(100).toArray())
     .map((u) => ({ id: String(u._id), name: u.name, avatar: u.avatar, balance: r2(u.balance), real: true }));
-  const day = parseInt(crypto.createHash("md5").update(todayKey()).digest("hex").slice(0, 6), 16);
-  const fillers = BOT_NAMES.map((n, i) => ({
-    id: `bot${i}`, name: n, avatar: BOT_AVATARS[(i + day) % BOT_AVATARS.length],
-    balance: r2(800 + ((day * (i + 3) * 7919) % 9000)), real: false,
-  }));
-  const all = [...real, ...fillers].sort((a, b) => b.balance - a.balance).map((u, i) => ({ ...u, rank: i + 1 }));
+  // الترتيب من لاعبين حقيقيين فقط (بلا لاعبين وهميين)
+  const all = real.map((u, i) => ({ ...u, rank: i + 1 }));
   let me = all.find((u) => u.id === String(myId)) || null;
   if (!me) {
     const mine = await users.findOne({ _id: myId });
     if (mine) {
       const above = await users.countDocuments({ balance: { $gt: mine.balance } });
-      me = { id: String(mine._id), name: mine.name, avatar: mine.avatar, balance: r2(mine.balance), real: true, rank: above + fillers.filter((f) => f.balance > mine.balance).length + 1 };
+      me = { id: String(mine._id), name: mine.name, avatar: mine.avatar, balance: r2(mine.balance), real: true, rank: above + 1 };
     }
   }
   return { board: all.slice(0, limit), me };
@@ -747,6 +744,14 @@ async function attachReferral(user, code) {
   const { users, refs } = await C();
   const inviter = (await users.find({}).limit(5000).toArray()).find((u) => inviteCodeOf(u._id) === code);
   if (!inviter || inviter._id === user._id) return;
+  // منع الحلقات: لا يُقبل داعٍ يكون المستخدم نفسه من أسلافه (3 مستويات)
+  let up = inviter._id;
+  for (let i = 0; i < 3 && up; i++) {
+    const r = await refs.findOne({ userId: up });
+    if (!r) break;
+    if (r.inviterId === user._id) return;
+    up = r.inviterId;
+  }
   const claimed = await fau(users, { _id: user._id, referredBy: null }, { $set: { referredBy: inviter._id } });
   if (!claimed) return;
   try {
@@ -919,11 +924,20 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   await bets.insertOne(bet);
   await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${bet.pick}` });
   if (user.referredBy && s.commissionEnabled) {
-    // العمولة تُحتسب فقط بعد «التأهيل» (استلام المدعو مكافأة 5$ من الإدارة) وعلى الرهانات اللاحقة له — بلا أثر رجعي
+    // العمولة 3 مستويات (10% / 5% / 3% من مبلغ الرهان) ولا تُفعَّل إلا بعد «التأهيل»:
+    // استلام المدعو مكافأة الدعوة (5$) من الإدارة، وتُحتسب على رهاناته اللاحقة فقط — بلا أثر رجعي
     const ref = await refs.findOne({ userId: user._id });
     if (ref) {
       const inc = { wagered: stake };
-      if (ref.qualified === true) inc.commissionEarned = r2(stake * 0.025);
+      if (ref.qualified === true) {
+        inc.commissionEarned = r2(stake * REF_RATES[0]);                 // المستوى 1: من دعاه مباشرة
+        const up1 = await refs.findOne({ userId: ref.inviterId });       // المستوى 2: من دعا الداعي
+        if (up1) {
+          inc.commissionL2 = r2(stake * REF_RATES[1]);
+          const up2 = await refs.findOne({ userId: up1.inviterId });     // المستوى 3
+          if (up2) inc.commissionL3 = r2(stake * REF_RATES[2]);
+        }
+      }
       await refs.updateOne({ userId: user._id }, { $inc: inc, $set: { active: true } });
     }
   }
@@ -1011,11 +1025,21 @@ route("GET", "/api/history", async ({ user, query }) => {
     transactions: (await txs.find({ userId: user._id }).sort({ at: -1 }).limit(limit).toArray()).map((t) => pub(t)),
   };
 });
+/* شبكة المستخدم بمستوياتها الثلاثة؛ commissionEarned = ما يكسبه هذا المستخدم من العضو عند مستواه */
 async function refsOf(userId) {
   const { refs } = await C();
-  return (await refs.find({ inviterId: userId }).sort({ joinedAt: -1 }).limit(500).toArray()).map((r) => {
-    const { _id, inviterId, ...rest } = r; return { id: _id, ...rest };
-  });
+  const out = [];
+  let parents = [userId];
+  for (let level = 1; level <= 3 && parents.length; level++) {
+    const rows = await refs.find({ inviterId: { $in: parents } }).sort({ joinedAt: -1 }).limit(500).toArray();
+    for (const r of rows) {
+      const { _id, inviterId, commissionL2, commissionL3, ...rest } = r;
+      const earned = level === 1 ? r.commissionEarned || 0 : level === 2 ? commissionL2 || 0 : commissionL3 || 0;
+      out.push({ id: _id, ...rest, level, commissionEarned: r2(earned) });
+    }
+    parents = rows.map((r) => r.userId);
+  }
+  return out;
 }
 route("GET", "/api/referrals", async ({ user }) => {
   const list = await refsOf(user._id);
@@ -1161,7 +1185,12 @@ route("POST", "/api/admin/users/:id/balance", A, async ({ params, body }) => {
   if (delta === 5) {
     const q = await fau(refs, { userId: id, qualified: { $ne: true } }, { $set: { qualified: true, qualifiedAt: Date.now() } });
     if (q) {
-      await addNotice(q.inviterId, { title: "✅ إحالتك أصبحت مؤهَّلة", body: `${u.name} استلم مكافأة الإدارة، وتُحتسب عمولتك على رهاناته من الآن.`, tone: "success" });
+      // مكافأة الإحالة (0.2$) لا تُمنح عند التسجيل، بل فقط الآن بعد أن استلم المدعو مكافأة الإدارة 5$ (مرة واحدة بفضل fau أعلاه)
+      if (REF_JOIN_BONUS > 0 && users) {
+        const inv = await credit(q.inviterId, REF_JOIN_BONUS);
+        if (inv) await addTx(q.inviterId, { kind: "bonus", amount: REF_JOIN_BONUS, label: `مكافأة إحالة ${u.name}` });
+      }
+      await addNotice(q.inviterId, { title: "✅ إحالتك أصبحت مؤهَّلة", body: `${u.name} استلم مكافأة الإدارة، فحصلت على $${REF_JOIN_BONUS} وتُحتسب عمولتك على رهاناته من الآن.`, tone: "success" });
       await adminLog(`تأهيل إحالة: ${id} ← ${q.inviterId}`);
     }
   }
