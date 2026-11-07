@@ -277,7 +277,7 @@ const BOT_USERNAME = process.env.BOT_USERNAME || "TawaqqoArenaBot";
 // نسب العمولة على مبلغ كل رهان: المستوى 1 = 10% ، المستوى 2 = 5% ، المستوى 3 = 3% (قابلة للتعديل عبر REF_RATES="0.10,0.05,0.03")
 const REF_RATES = (process.env.REF_RATES || "0.10,0.05,0.03").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0).concat([0, 0, 0]).slice(0, 3);
 const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // مكافأة الداعي عن كل صديق مؤهَّل (تُمنح مرة واحدة عند التأهيل فقط)
-const START_BALANCE = Number(process.env.START_BALANCE ?? 0); // رصيد البداية: 0 افتراضياً (لا رصيد وهمي)
+const START_BALANCE = Number(process.env.START_BALANCE ?? 0); // رصيد البداية للمستخدم الجديد: 0$ (يمكن تغييره بمتغير البيئة START_BALANCE)
 const MAX_CATCHUP = 150;                 // أقصى عدد نبضات تُحسب في طلب واحد
 const ENDED_KEEP_MS = 15 * 60_000;       // المباراة المنتهية تُستبدل بجديدة بعد 15 دقيقة
 
@@ -306,6 +306,7 @@ const DEFAULT_SETTINGS = {
   dailyBonusEnabled: true, commissionEnabled: true, autoDepositEnabled: true,
   bonusBase: 2, bonusPerStreak: 0.5, bonusCooldownHours: 24,
   celebrations: true, withdrawAutoApprove: true, minWithdraw: 5, maxWithdraw: 0,
+  minDeposit: Math.max(0, Number(process.env.MIN_DEPOSIT) || 10), maxDeposit: Number(process.env.MAX_DEPOSIT) || 5000, // حدود الإيداع (تُعدَّل من لوحة الأدمن)
   announcement: { enabled: false, text: "", tone: "info" },
   supportEnabled: true, supportUrl: "https://t.me/abdoblilach",
   supportTipTitle: "الدعم الفني", supportTipText: "نحن متصلون · كلّمنا على تلجرام",
@@ -420,7 +421,7 @@ const publicUser = (u, cfg) => ({
   id: u._id, name: u.name, avatar: u.avatar, joinedAt: u.joinedAt,
   balance: r2(u.balance), vipXp: u.vipXp, vip: vipOf(u.vipXp, cfg),
   streak: u.streak, bestStreak: u.bestStreak, frozen: u.frozen,
-  inviteCode: inviteCodeOf(u._id), lastBonusAt: u.lastBonusAt,
+  inviteCode: inviteCodeOf(u._id), lastBonusAt: u.lastBonusAt, lastSeenAt: u.lastSeenAt || 0,
 });
 async function addTx(userId, tx) {
   const { txs } = await C();
@@ -546,8 +547,24 @@ async function syncMatches() {
   }
   return (await loadState()).matches;
 }
+/* ===== سوق «نتيجة المباراة» (فوز المستضيف / تعادل / فوز الضيف): مجمّع مستقل من 3 خيارات =====
+ * قبل أول رهان عليه يُشتق من مجمّع النتائج الدقيقة (مجموع خلايا فوز/تعادل/فوز + 1/3 لـ«أخرى») ثم يُخزَّن ويتحرك بأموال اللاعبين. */
+const RES_PICKS = ["1", "X", "2"];
+const rPoolsOf = (m) => {
+  if (Array.isArray(m.rPools) && m.rPools.length === 3) return m.rPools;
+  const r = [0, 0, 0];
+  for (let h = 0; h < 4; h++) for (let a = 0; a < 4; a++) r[h > a ? 0 : h === a ? 1 : 2] += m.pools[h * 4 + a] || 0;
+  const other = (m.pools[OPT_COUNT - 1] || 0) / 3;
+  return r.map((v) => Math.max(1, +(v + other).toFixed(2)));
+};
+const resultIdx = (score) => (score[0] > score[1] ? 0 : score[0] === score[1] ? 1 : 2);
+const poolsForBet = (m, b) => (b.market === "result" ? rPoolsOf(m) : m.pools);
+const pickText = (b, m) => (b.market === "result" ? [`فوز ${m.home.name}`, "تعادل", `فوز ${m.away.name}`][RES_PICKS.indexOf(b.pick)] || b.pick : b.pick);
 const matchView = (m) => ({
   ...m,
+  rPools: rPoolsOf(m),
+  rOdds: rPoolsOf(m).map((_, i) => +oddsOf(rPoolsOf(m), i, m.boosted).toFixed(3)),
+  rChances: rPoolsOf(m).map((_, i) => +chanceOf(rPoolsOf(m), i).toFixed(4)),
   odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted).toFixed(3)),
   chances: m.pools.map((_, i) => +chanceOf(m.pools, i).toFixed(4)),
   totalPool: Math.round(totalPool(m.pools)),
@@ -604,7 +621,7 @@ async function settleBets(endedIds, matches, { userId, onlyBetId } = {}) {
     const u = await users.findOne({ _id: b.userId });
     if (!u) continue;
     const scoreStr = m.score[0] <= 3 && m.score[1] <= 3 ? `${m.score[0]}-${m.score[1]}` : "أخرى";
-    if (scoreStr === b.pick) {
+    if (b.market === "result" ? RES_PICKS[resultIdx(m.score)] === b.pick : scoreStr === b.pick) {
       const payout = payoutOf(b.stake, b.odds, streakBonus(u.streak || 0));
       const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "won", payout, settledAt: Date.now() } });
       if (!claimed) continue;
@@ -612,8 +629,8 @@ async function settleBets(endedIds, matches, { userId, onlyBetId } = {}) {
         $inc: { balance: payout, streak: 1, vipXp: Math.round(b.stake) },
         $set: { bestStreak: Math.max(u.bestStreak || 0, (u.streak || 0) + 1) },
       });
-      await addTx(u._id, { kind: "win", amount: payout, label: `فوز ${b.matchLabel} — ${b.pick}` });
-      await addNotice(u._id, { title: `🏆 فزت $${payout}!`, body: `${b.matchLabel} انتهت ${scoreStr} وتوقّعك ${b.pick} أصاب!`, tone: "success" });
+      await addTx(u._id, { kind: "win", amount: payout, label: `فوز ${b.matchLabel} — ${pickText(b, m)}` });
+      await addNotice(u._id, { title: `🏆 فزت $${payout}!`, body: `${b.matchLabel} انتهت ${scoreStr} وتوقّعك ${pickText(b, m)} أصاب!`, tone: "success" });
       events.push({ userId: u._id, betId: b._id, status: "won" });
     } else {
       const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "lost", payout: 0, settledAt: Date.now() } });
@@ -632,7 +649,7 @@ async function cashoutQuote(u, b, cfg, ms) {
   if (!m) return null;
   const progress = m.status === "live" ? Math.min(0.9, m.minute / 90) : m.status === "ended" ? 1 : 0.1;
   const seed = `${b._id}:${Math.floor(Date.now() / 4000)}`;
-  const raw = cashoutValue(b.stake, b.odds, oddsOf(m.pools, b.optIndex, m.boosted), progress, seed);
+  const raw = cashoutValue(b.stake, b.odds, oddsOf(poolsForBet(m, b), b.optIndex, m.boosted), progress, seed);
   return r2(raw * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
 }
 /** استرداد رهان مفتوح (إلغاء/حذف مباراة) */
@@ -644,6 +661,11 @@ async function refundBet(b, label) {
   await addTx(b.userId, { kind: "refund", amount: b.stake, label: `${label} ${b.matchLabel}` });
   await mutateState((ms) => ms.map((m) => {
     if (m.id !== b.matchId) return m;
+    if (b.market === "result") {
+      const rp = rPoolsOf(m).slice();
+      rp[b.optIndex] = Math.max(1, rp[b.optIndex] - b.stake);
+      return { ...m, rPools: rp };
+    }
     const pools = m.pools.slice();
     pools[b.optIndex] = Math.max(1, pools[b.optIndex] - b.stake);
     return withOdds(m, pools);
@@ -690,7 +712,7 @@ route("GET", "/api/config", { auth: false, sync: false }, async ({ cfg }) => {
     maintenance: s.maintenance, maintenanceMsg: s.maintenanceMsg, announcement: s.announcement,
     bettingEnabled: s.bettingEnabled, depositsEnabled: s.depositsEnabled, withdrawalsEnabled: s.withdrawalsEnabled,
     liveBetting: s.liveBetting, cashoutEnabled: s.cashoutEnabled, cancelEnabled: s.cancelEnabled,
-    minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw,
+    minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw, minDeposit: s.minDeposit, maxDeposit: s.maxDeposit,
     dailyBonusEnabled: s.dailyBonusEnabled, commissionEnabled: s.commissionEnabled, autoDepositEnabled: s.autoDepositEnabled,
     bonusBase: s.bonusBase, bonusPerStreak: s.bonusPerStreak, bonusCooldownHours: s.bonusCooldownHours,
     bonusSectionTitle: s.bonusSectionTitle, bonusTitle: s.bonusTitle, celebrations: s.celebrations,
@@ -875,10 +897,13 @@ route("GET", "/api/bets", async ({ user, query, cfg, matches }) => {
 route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   assertActive(user, cfg);
   const s = cfg.settings, stake = Number(body.stake);
-  const optIndex = body.optIndex !== undefined ? Number(body.optIndex) : SCORES.indexOf(body.pick);
+  const market = body.market === "result" ? "result" : "exact";
+  const optIndex = market === "result"
+    ? (body.optIndex !== undefined ? Number(body.optIndex) : RES_PICKS.indexOf(String(body.pick).toUpperCase()))
+    : (body.optIndex !== undefined ? Number(body.optIndex) : SCORES.indexOf(body.pick));
   const m0 = findMatch(matches, body.matchId);
   if (!m0) throw bad("المباراة غير متوفرة");
-  if (!Number.isInteger(optIndex) || optIndex < 0 || optIndex >= OPT_COUNT) throw bad("خيار غير صالح");
+  if (!Number.isInteger(optIndex) || optIndex < 0 || optIndex >= (market === "result" ? 3 : OPT_COUNT)) throw bad("خيار غير صالح");
   const checkMatch = (m) => {
     if (!s.bettingEnabled) throw forbid("الرهان متوقف حالياً");
     if (m.suspended) throw bad("الرهان على هذه المباراة موقوف مؤقتاً");
@@ -895,7 +920,7 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   const { bets, refs } = await C();
   if (user.limits.dailyLossLimit > 0) {
     const since = new Date().setHours(0, 0, 0, 0);
-    const today = await bets.find({ userId: user._id, status: "lost", createdAt: { $gte: since } }).toArray();
+    const today = await bets.find({ userId: user._id, status: "lost", compensated: { $ne: true }, createdAt: { $gte: since } }).toArray();
     if (today.reduce((a, b) => a + b.stake, 0) >= user.limits.dailyLossLimit) throw forbid("بلغت حد الخسارة اليومي");
   }
   // 1) خصم ذرّي  2) إضافة للمجمّع بسعر لحظي  3) تسجيل الرهان — وإن فشلت خطوة نُعيد المبلغ
@@ -907,9 +932,15 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       const m = findMatch(ms, m0.id);
       if (!m) throw bad("المباراة غير متوفرة");
       checkMatch(m);
-      odds = oddsAfter(m.pools, optIndex, stake, m.boosted);
       matchLabel = `${m.home.name} × ${m.away.name}`;
       boosted = m.boosted;
+      if (market === "result") {
+        const rp = rPoolsOf(m).slice();
+        odds = oddsAfter(rp, optIndex, stake, m.boosted);
+        rp[optIndex] += stake;
+        return ms.map((x) => (x.id === m.id ? { ...x, rPools: rp } : x));
+      }
+      odds = oddsAfter(m.pools, optIndex, stake, m.boosted);
       const pools = m.pools.slice(); pools[optIndex] += stake;
       return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-59), +odds.toFixed(3)] : h)) } : x));
     });
@@ -918,11 +949,11 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
     throw e;
   }
   const bet = {
-    _id: uid(), userId: user._id, matchId: m0.id, matchLabel, pick: SCORES[optIndex], optIndex, stake, odds,
+    _id: uid(), userId: user._id, matchId: m0.id, matchLabel, market, pick: market === "result" ? RES_PICKS[optIndex] : SCORES[optIndex], optIndex, stake, odds,
     status: "open", payout: 0, createdAt: Date.now(), streakBonus: streakBonus(user.streak || 0),
   };
   await bets.insertOne(bet);
-  await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${bet.pick}` });
+  await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${pickText(bet, m0)}` });
   if (user.referredBy && s.commissionEnabled) {
     // العمولة 3 مستويات (10% / 5% / 3% من مبلغ الرهان) ولا تُفعَّل إلا بعد «التأهيل»:
     // استلام المدعو مكافأة الدعوة (5$) من الإدارة، وتُحتسب على رهاناته اللاحقة فقط — بلا أثر رجعي
@@ -1129,10 +1160,12 @@ route("POST", "/api/admin/login", { auth: false, sync: false }, async ({ body })
 const A = { admin: true };
 route("GET", "/api/admin/overview", A, async ({ matches }) => {
   const { users, bets, txs } = await C();
-  const us = await users.find({}, { projection: { balance: 1 } }).limit(50000).toArray();
+  const us = await users.find({}, { projection: { balance: 1, lastSeenAt: 1 } }).limit(50000).toArray();
+  const nowTs = Date.now();
   const bs = await bets.find({}, { projection: { stake: 1, status: 1 } }).limit(100000).toArray();
   return {
-    users: us.length, balanceTotal: r2(us.reduce((a, u) => a + u.balance, 0)),
+    users: us.length, online: us.filter((u) => nowTs - (u.lastSeenAt || 0) < 90_000).length, active24h: us.filter((u) => nowTs - (u.lastSeenAt || 0) < 86_400_000).length, serverTime: nowTs,
+    balanceTotal: r2(us.reduce((a, u) => a + u.balance, 0)),
     openBets: bs.filter((b) => b.status === "open").length, totalBets: bs.length, wagered: r2(bs.reduce((a, b) => a + b.stake, 0)),
     matches: matches.length, live: matches.filter((m) => m.status === "live").length,
     pendingWithdrawals: await txs.countDocuments({ kind: "withdraw", status: "pending" }),
@@ -1242,8 +1275,6 @@ const DEP = {
   contract: process.env.USDT_TRC20_CONTRACT || "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
   tronApi: (process.env.TRONGRID_URL || "https://api.trongrid.io").replace(/\/$/, ""),
   tronKey: process.env.TRONGRID_API_KEY || "",
-  min: Math.max(10, Number(process.env.MIN_DEPOSIT) || 10),
-  max: Number(process.env.MAX_DEPOSIT) || 5000,
   ttlMs: (Number(process.env.DEPOSIT_TTL_MIN) || 30) * 60_000,
   graceMs: 10 * 60_000, // نقبل تحويلاً وصل متأخراً قليلاً بعد انتهاء المهلة
 };
@@ -1325,8 +1356,8 @@ async function scanDeposits({ force = false } = {}) {
 }
 const safeScan = (opts) => scanDeposits(opts).catch((e) => { console.error("scanDeposits:", e.message); return 0; });
 
-route("GET", "/api/deposit/config", { auth: false, sync: false }, () => ({
-  methods: { trc20: true }, trc20Address: DEP.address, minDeposit: DEP.min, maxDeposit: DEP.max, ttlMin: Math.round(DEP.ttlMs / 60_000),
+route("GET", "/api/deposit/config", { auth: false, sync: false }, ({ cfg }) => ({
+  methods: { trc20: true }, trc20Address: DEP.address, minDeposit: cfg.settings.minDeposit, maxDeposit: cfg.settings.maxDeposit, ttlMin: Math.round(DEP.ttlMs / 60_000),
 }));
 route("POST", "/api/deposit/orders", { sync: false }, async (ctx) => {
   const user = depositUser(ctx), { body, cfg } = ctx;
@@ -1334,7 +1365,8 @@ route("POST", "/api/deposit/orders", { sync: false }, async (ctx) => {
   if (!cfg.settings.depositsEnabled) throw forbid("الإيداع متوقف حالياً");
   if (body.method && body.method !== "trc20") throw bad("طريقة الإيداع المتاحة: USDT TRC-20 فقط");
   const base = Math.floor(Number(body.amount) * 100) / 100;
-  if (!Number.isFinite(base) || base < DEP.min || base > DEP.max) throw bad(`المبلغ يجب أن يكون بين $${DEP.min} و $${DEP.max}`);
+  const dMin = Number(cfg.settings.minDeposit) || 0, dMax = Number(cfg.settings.maxDeposit) || 0; // من إعدادات الأدمن (0 = بلا حد أقصى)
+  if (!Number.isFinite(base) || base <= 0 || base < dMin || (dMax > 0 && base > dMax)) throw bad(`المبلغ يجب أن يكون ${dMax > 0 ? `بين $${dMin} و $${dMax}` : `$${dMin} على الأقل`}`);
   const { deposits } = await C();
   const now = Date.now();
   await deposits.updateMany({ status: "pending", liveUntil: { $lt: now } }, { $set: { status: "expired" } });
@@ -1376,9 +1408,10 @@ route("GET", "/api/cron/deposits", { auth: false, sync: false }, async ({ req })
   return { ok: true, credited: await scanDeposits({ force: true }) };
 });
 /* إدارة: كل الطلبات + التحويلات غير المطابقة (مبلغ خاطئ) + اعتماد يدوي */
-route("GET", "/api/admin/deposits", A, async () => {
+route("GET", "/api/admin/deposits", A, async ({ query }) => {
   const { deposits } = await C();
-  return (await deposits.find({}).sort({ createdAt: -1 }).limit(200).toArray()).map((o) => ({ ...depView(o), userId: o.userId, balanceCredited: !!o.balanceCredited }));
+  const f = query.userId ? { userId: Number(query.userId) } : {}; // ?userId= لعرض إيداعات لاعب واحد
+  return (await deposits.find(f).sort({ createdAt: -1 }).limit(200).toArray()).map((o) => ({ ...depView(o), userId: o.userId, balanceCredited: !!o.balanceCredited }));
 });
 route("GET", "/api/admin/deposits/unmatched", A, async () => {
   const { deposits } = await C();
@@ -1401,10 +1434,13 @@ route("POST", "/api/admin/deposits/credit", A, async ({ body }) => {
 });
 
 /* مباريات (إدارة) */
+/* رابط صورة (شعار فريق/دوري): http(s) فقط وبطول معقول، وإلا يُهمَل — لمنع javascript: وما شابه */
+const cleanLogo = (u) => { const v = typeof u === "string" ? u.trim() : ""; return /^https?:\/\/\S{3,500}$/i.test(v) ? v : ""; };
+const cleanTeam = (t) => (t && typeof t === "object" ? { ...t, logo: cleanLogo(t.logo) } : t);
 route("POST", "/api/admin/matches", A, async ({ body }) => {
   for (const k of ["leagueId", "home", "away"]) if (!body?.[k]) throw bad(`الحقل ${k} مطلوب`);
   const id = `m${Date.now().toString(36)}`;
-  const team = (t) => (typeof t === "string" ? { name: t, short: t.slice(0, 3).toUpperCase(), colors: ["#1a6ef0", "#0b3a8f"] } : t);
+  const team = (t) => (typeof t === "string" ? { name: t, short: t.slice(0, 3).toUpperCase(), colors: ["#1a6ef0", "#0b3a8f"] } : cleanTeam(t));
   const startsAt = body.startsAt ? Number(body.startsAt) : Date.now() + (Number(body.inMinutes) || 60) * 60000;
   const live = !!body.live, minute = live ? Math.min(89, Math.max(1, Number(body.minute) || 1)) : 0;
   const bias = Math.min(2, Math.max(0.5, Number(body.bias) || 1.05));
@@ -1421,7 +1457,7 @@ route("PATCH", "/api/admin/matches/:id", A, async ({ params, body }) => {
     if (!findMatch(ms, params.id)) throw notFound("المباراة غير موجودة");
     return ms.map((m) => {
       if (m.id !== params.id) return m;
-      const n = { ...m }; for (const k of allowed) if (body[k] !== undefined) n[k] = body[k];
+      const n = { ...m }; for (const k of allowed) if (body[k] !== undefined) n[k] = k === "home" || k === "away" ? cleanTeam(body[k]) : body[k];
       return (out = n);
     });
   });
@@ -1503,12 +1539,12 @@ route("DELETE", "/api/admin/payments/:id", A, async ({ params }) => {
   return { ok: true };
 });
 route("PUT", "/api/admin/leagues/:id", A, async ({ params, body }) => {
-  let out; await editList("leagues", (l) => { const x = l.find((y) => y.id === params.id); if (!x) throw notFound("الدوري غير موجود"); Object.assign(x, body, { id: x.id }); out = x; return l; }, `تعديل الدوري ${params.id}`);
+  let out; await editList("leagues", (l) => { const x = l.find((y) => y.id === params.id); if (!x) throw notFound("الدوري غير موجود"); Object.assign(x, body, { id: x.id }); if ("logo" in body) x.logo = cleanLogo(body.logo); out = x; return l; }, `تعديل الدوري ${params.id}`);
   return out;
 });
 route("POST", "/api/admin/leagues", A, async ({ body }) => {
   if (!body?.name) throw bad("الاسم مطلوب");
-  const l = { id: uid(), flag: "🏳️", country: "", hue: 150, ...body };
+  const l = { id: uid(), flag: "🏳️", country: "", hue: 150, ...body, logo: cleanLogo(body.logo) };
   await editList("leagues", (arr) => [...arr, l], `إضافة دوري ${l.name}`);
   return l;
 });
@@ -1548,6 +1584,30 @@ route("GET", "/api/admin/bets", A, async ({ query }) => {
   if (query.status) f.status = query.status;
   if (query.userId) f.userId = Number(query.userId);
   return (await bets.find(f).sort({ createdAt: -1 }).limit(Math.min(Number(query.limit) || 1000, 5000)).toArray()).map((b) => pub(b, true));
+});
+/* ---- تعويض خاسري مباراة: إعادة مبلغ رهانات الخاسرين (كلياً أو بنسبة) لمرة واحدة لكل رهان ---- */
+route("GET", "/api/admin/matches/:id/compensation", A, async ({ params }) => {
+  const { bets } = await C();
+  const list = await bets.find({ matchId: params.id, status: "lost", compensated: { $ne: true } }).toArray();
+  return { count: list.length, players: new Set(list.map((b) => b.userId)).size, totalStake: r2(list.reduce((a, b) => a + b.stake, 0)) };
+});
+route("POST", "/api/admin/matches/:id/compensate", A, async ({ params, body }) => {
+  const percent = Math.min(100, Math.max(1, Number(body?.percent) || 100));
+  const { bets } = await C();
+  const list = await bets.find({ matchId: params.id, status: "lost", compensated: { $ne: true } }).toArray();
+  let count = 0, total = 0;
+  const players = new Set();
+  for (const b of list) {
+    const amount = r2((b.stake * percent) / 100);
+    const claimed = await fau(bets, { _id: b._id, status: "lost", compensated: { $ne: true } }, { $set: { compensated: true, compensatedAmount: amount, compensatedAt: Date.now(), payout: amount } });
+    if (!claimed) continue; // عُوِّض بالفعل (حماية من الضغط المزدوج)
+    await credit(b.userId, amount);
+    await addTx(b.userId, { kind: "refund", amount, label: `تعويض خسارة ${b.matchLabel}` });
+    await addNotice(b.userId, { title: "🎁 تعويض خسارة", body: `تم تعويضك $${amount} عن رهانك في ${b.matchLabel}.`, tone: "gold" });
+    count++; total += amount; players.add(b.userId);
+  }
+  await adminLog(`تعويض خاسري المباراة ${params.id}: ${count} رهان · $${r2(total)} · ${percent}%`);
+  return { ok: true, compensated: count, players: players.size, total: r2(total) };
 });
 route("POST", "/api/admin/bets/:id/settle", A, async ({ params, body }) => {
   const { bets, users } = await C();
@@ -1857,6 +1917,12 @@ export default async function handler(req, res) {
         if (!s) throw new HttpError(401, "يلزم تسجيل الدخول كمدير");
       } else if (r.auth !== false) {
         ctx.user = await authUser(req);
+        // آخر ظهور: يُحدَّث على أي طلب موثّق (بحد أدنى 20 ثانية بين كتابتين) — للضيف المشترك (0) لا يُسجَّل
+        if (ctx.user._id && Date.now() - (ctx.user.lastSeenAt || 0) > 20_000) {
+          const now = Date.now();
+          ctx.user.lastSeenAt = now;
+          (await C()).users.updateOne({ _id: ctx.user._id }, { $set: { lastSeenAt: now } }).catch(() => undefined);
+        }
         if (ctx.cfg.settings.maintenance && req.method !== "GET") throw new HttpError(503, ctx.cfg.settings.maintenanceMsg);
       }
       if (r.sync !== false) ctx.matches = await syncMatches();
