@@ -25,6 +25,13 @@
  *      CRON_SECRET       اختياري: لتفعيل /api/cron/deposits (Vercel Cron)
  *      DEPOSIT_ALLOW_GUESTS  لا تضعها إلا للتجربة (الإيداع يتطلب تيليجرام + BOT_TOKEN)
  *
+ *      --- وسيط كرة القدم API-Sports (Football Widgets) ---
+ *      API_FOOTBALL_KEY            مفتاح API-Sports — يبقى هنا في السيرفر فقط ولا يصل للمتصفح أبداً
+ *      FOOTBALL_LEAGUES            الدوريات المسموحة (الافتراضي 39,140 = الإنجليزي + الإسباني)
+ *      FOOTBALL_ALLOWED_ORIGINS    اختياري: أصول مسموحة مفصولة بفواصل، مثل https://my-app.netlify.app
+ *      FOOTBALL_UPSTREAM_PER_MIN   حد الطلبات الصادرة لـ API-Sports في الدقيقة (الافتراضي 10 = حد الخطة المجانية)
+ *      FOOTBALL_IP_PER_MIN         حد الطلبات لكل IP في الدقيقة (الافتراضي 120)
+ *
  *  محلياً: ضع المتغيّرات في ملف .env بجانب هذا الملف ثم: node server.js
  * ========================================================================== */
 import http from "node:http";
@@ -38,7 +45,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  * الفكرة: السعر يتحرّك حسب أموال المشاركين. عمولة المنصة 5% تُخصم من المجمّع.
  * لاحقاً على الخادم: نفس المعادلات تُنفَّذ على السيرفر وتُبث للواجهة عبر WebSocket.
  */
-const FEE = 0.05;
+const FEE = 0; // الافتراضي 0% — الفعلية من إعدادات الأدمن (platformFeePct)
+let FEE_NOW = FEE; // النسبة العامة الحالية (تُحدَّث عند تحميل/حفظ الإعدادات)
+const clampFeePct = (v, fb = 0) => { const n = Number(v); return Number.isFinite(n) ? Math.min(50, Math.max(0, n)) : fb; };
+/** نسبة المنصة لمباراة: نسبتها الخاصة إن وُضعت (0..50) وإلا النسبة العامة */
+const feeOf = (m) => (m && typeof m.feePct === "number" && m.feePct >= 0 && m.feePct <= 50 ? m.feePct / 100 : FEE_NOW);
 const HOUSE_SEED = 0.62; // حصة المنصة الأولية من كل مجمّع (سيولة تأسيسية)
 const SCORES = [
     ...Array.from({ length: 4 }, (_, h) => Array.from({ length: 4 }, (_, a) => `${h}-${a}`)).flat(),
@@ -52,18 +63,18 @@ const chanceOf = (pools, i) => {
     return t > 0 ? pools[i] / t : 1 / OPT_COUNT;
 };
 /** السعر الحالي للخيار i */
-const oddsOf = (pools, i, boosted = false) => {
+const oddsOf = (pools, i, boosted = false, fee = FEE_NOW) => {
     const p = pools[i];
     if (p <= 0)
         return 1.01;
-    const base = (totalPool(pools) * (1 - FEE)) / p;
+    const base = (totalPool(pools) * (1 - fee)) / p;
     return Math.max(1.01, boosted ? base * 1.15 : base);
 };
 /** السعر بعد إضافة رهان جديد — ما سيراه المستخدم فعلياً */
-const oddsAfter = (pools, i, stake, boosted = false) => {
+const oddsAfter = (pools, i, stake, boosted = false, fee = FEE_NOW) => {
     const pools2 = pools.slice();
     pools2[i] += stake;
-    return oddsOf(pools2, i, boosted);
+    return oddsOf(pools2, i, boosted, fee);
 };
 /** مكافأة السلسلة: +2% لكل فوز متتالٍ حتى +10% */
 const streakBonus = (streak) => Math.min(Math.max(streak, 0), 5) * 0.02;
@@ -233,7 +244,7 @@ function tickMatches(matches) {
                 return Math.max(2, Math.round(p + noise + gravity));
             });
             // تحديث تاريخ الأسعار للرسم البياني
-            const odds = pools.map((_, i) => oddsOf(pools, i, m.boosted));
+            const odds = pools.map((_, i) => oddsOf(pools, i, m.boosted, feeOf(m)));
             const oddsHistory = m.oddsHistory.map((hist, i) => [...hist.slice(-59), +odds[i].toFixed(3)]);
             return { ...m, minute, score, pools, oddsHistory };
         }
@@ -249,7 +260,7 @@ function driftUpcoming(matches) {
         const i = Math.floor(Math.random() * OPT_COUNT);
         const pools = m.pools.slice();
         pools[i] = Math.max(3, Math.round(pools[i] * (0.97 + Math.random() * 0.08)));
-        const odds = pools.map((_, k) => oddsOf(pools, k, m.boosted));
+        const odds = pools.map((_, k) => oddsOf(pools, k, m.boosted, feeOf(m)));
         const oddsHistory = m.oddsHistory.map((hist, k) => (k === i ? [...hist.slice(-59), +odds[k].toFixed(3)] : hist));
         return { ...m, pools, oddsHistory };
     });
@@ -303,6 +314,7 @@ const DEFAULT_SETTINGS = {
   simPaused: false, simSpeedMs: Number(process.env.SIM_SPEED_MS) || 1600,
   liveBetting: false, cashoutEnabled: true, cancelEnabled: true,
   minStake: 1, maxStake: 0, cashoutMarginPct: 0,
+  platformFeePct: 0, // نسبة ربح المنصة المخصومة من مجمّع كل مباراة (0..50) — الافتراضي 0%، وتُعدَّل من لوحة الأدمن
   dailyBonusEnabled: true, commissionEnabled: true, autoDepositEnabled: true,
   bonusBase: 2, bonusPerStreak: 0.5, bonusCooldownHours: 24,
   celebrations: true, withdrawAutoApprove: true, minWithdraw: 5, maxWithdraw: 0,
@@ -387,6 +399,7 @@ async function getConfig(force = false) {
     try { await meta.insertOne(doc); } catch { doc = await meta.findOne({ _id: "config" }); }
   }
   doc.settings = { ...DEFAULT_SETTINGS, ...(doc.settings || {}), announcement: { ...DEFAULT_SETTINGS.announcement, ...(doc.settings?.announcement || {}) } };
+  FEE_NOW = clampFeePct(doc.settings.platformFeePct, FEE * 100) / 100;
   cfgCache = { at: Date.now(), doc };
   return doc;
 }
@@ -563,17 +576,18 @@ const pickText = (b, m) => (b.market === "result" ? [`فوز ${m.home.name}`, "�
 const matchView = (m) => ({
   ...m,
   rPools: rPoolsOf(m),
-  rOdds: rPoolsOf(m).map((_, i) => +oddsOf(rPoolsOf(m), i, m.boosted).toFixed(3)),
+  rOdds: rPoolsOf(m).map((_, i) => +oddsOf(rPoolsOf(m), i, m.boosted, feeOf(m)).toFixed(3)),
   rChances: rPoolsOf(m).map((_, i) => +chanceOf(rPoolsOf(m), i).toFixed(4)),
-  odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted).toFixed(3)),
+  odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted, feeOf(m)).toFixed(3)),
   chances: m.pools.map((_, i) => +chanceOf(m.pools, i).toFixed(4)),
   totalPool: Math.round(totalPool(m.pools)),
   options: SCORES,
+  effFeePct: +(feeOf(m) * 100).toFixed(2), // النسبة المطبّقة فعلياً على هذه المباراة (الخاصة أو العامة)
   progress: +matchProgress(m).toFixed(3),
 });
 const withOdds = (m, pools) => ({
   ...m, pools,
-  oddsHistory: m.oddsHistory.map((h, i) => [...h.slice(-59), +oddsOf(pools, i, m.boosted).toFixed(3)]),
+  oddsHistory: m.oddsHistory.map((h, i) => [...h.slice(-59), +oddsOf(pools, i, m.boosted, feeOf(m)).toFixed(3)]),
 });
 const findMatch = (ms, id) => ms.find((m) => m.id === id);
 
@@ -649,7 +663,7 @@ async function cashoutQuote(u, b, cfg, ms) {
   if (!m) return null;
   const progress = m.status === "live" ? Math.min(0.9, m.minute / 90) : m.status === "ended" ? 1 : 0.1;
   const seed = `${b._id}:${Math.floor(Date.now() / 4000)}`;
-  const raw = cashoutValue(b.stake, b.odds, oddsOf(poolsForBet(m, b), b.optIndex, m.boosted), progress, seed);
+  const raw = cashoutValue(b.stake, b.odds, oddsOf(poolsForBet(m, b), b.optIndex, m.boosted, feeOf(m)), progress, seed);
   return r2(raw * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
 }
 /** استرداد رهان مفتوح (إلغاء/حذف مباراة) */
@@ -712,7 +726,7 @@ route("GET", "/api/config", { auth: false, sync: false }, async ({ cfg }) => {
     maintenance: s.maintenance, maintenanceMsg: s.maintenanceMsg, announcement: s.announcement,
     bettingEnabled: s.bettingEnabled, depositsEnabled: s.depositsEnabled, withdrawalsEnabled: s.withdrawalsEnabled,
     liveBetting: s.liveBetting, cashoutEnabled: s.cashoutEnabled, cancelEnabled: s.cancelEnabled,
-    minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw, minDeposit: s.minDeposit, maxDeposit: s.maxDeposit,
+    platformFeePct: s.platformFeePct, minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw, minDeposit: s.minDeposit, maxDeposit: s.maxDeposit,
     dailyBonusEnabled: s.dailyBonusEnabled, commissionEnabled: s.commissionEnabled, autoDepositEnabled: s.autoDepositEnabled,
     bonusBase: s.bonusBase, bonusPerStreak: s.bonusPerStreak, bonusCooldownHours: s.bonusCooldownHours,
     bonusSectionTitle: s.bonusSectionTitle, bonusTitle: s.bonusTitle, celebrations: s.celebrations,
@@ -738,7 +752,7 @@ route("GET", "/api/ticker", PUBLIC_R, ({ matches }) => ({
   at: Date.now(),
   matches: matches.map((m) => ({
     id: m.id, status: m.status, minute: m.minute, score: m.score,
-    odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted).toFixed(3)), totalPool: Math.round(totalPool(m.pools)),
+    odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted, feeOf(m)).toFixed(3)), totalPool: Math.round(totalPool(m.pools)),
   })),
 }));
 route("GET", "/api/matches/:id", PUBLIC_R, ({ params, matches }) => {
@@ -751,8 +765,8 @@ route("GET", "/api/matches/:id/odds", PUBLIC_R, ({ params, query, matches }) => 
   if (!m) throw notFound("المباراة غير موجودة");
   const stake = Number(query.stake) || 0;
   return m.pools.map((_, i) => ({
-    index: i, pick: SCORES[i], odds: +oddsOf(m.pools, i, m.boosted).toFixed(3),
-    oddsAfterStake: stake > 0 ? +oddsAfter(m.pools, i, stake, m.boosted).toFixed(3) : undefined,
+    index: i, pick: SCORES[i], odds: +oddsOf(m.pools, i, m.boosted, feeOf(m)).toFixed(3),
+    oddsAfterStake: stake > 0 ? +oddsAfter(m.pools, i, stake, m.boosted, feeOf(m)).toFixed(3) : undefined,
     chance: +chanceOf(m.pools, i).toFixed(4),
   }));
 });
@@ -936,11 +950,11 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       boosted = m.boosted;
       if (market === "result") {
         const rp = rPoolsOf(m).slice();
-        odds = oddsAfter(rp, optIndex, stake, m.boosted);
+        odds = oddsAfter(rp, optIndex, stake, m.boosted, feeOf(m));
         rp[optIndex] += stake;
         return ms.map((x) => (x.id === m.id ? { ...x, rPools: rp } : x));
       }
-      odds = oddsAfter(m.pools, optIndex, stake, m.boosted);
+      odds = oddsAfter(m.pools, optIndex, stake, m.boosted, feeOf(m));
       const pools = m.pools.slice(); pools[optIndex] += stake;
       return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-59), +odds.toFixed(3)] : h)) } : x));
     });
@@ -1176,7 +1190,9 @@ route("PUT", "/api/admin/settings", A, async ({ body, cfg }) => {
   const keys = Object.keys(body || {}).filter((k) => k in DEFAULT_SETTINGS);
   const settings = { ...cfg.settings };
   for (const k of keys) settings[k] = k === "announcement" ? { ...settings.announcement, ...body[k] } : body[k];
+  if (keys.includes("platformFeePct")) settings.platformFeePct = clampFeePct(settings.platformFeePct, 0);
   await saveConfig({ settings });
+  if (keys.includes("platformFeePct")) FEE_NOW = settings.platformFeePct / 100;
   await adminLog(`إعدادات: ${keys.join("، ")}`);
   return settings;
 });
@@ -1446,18 +1462,19 @@ route("POST", "/api/admin/matches", A, async ({ body }) => {
   const bias = Math.min(2, Math.max(0.5, Number(body.bias) || 1.05));
   const tpl = buildMatch({ league: body.leagueId, home: team(body.home), away: team(body.away), inMinutes: live ? -1 : 60, bias, hot: !!body.hot, boosted: !!body.boosted }, 0);
   const nm = { ...tpl, id, leagueId: body.leagueId, home: team(body.home), away: team(body.away), startsAt: live ? Date.now() - minute * 60000 : startsAt, status: live ? "live" : "upcoming", minute, score: [0, 0], hot: !!body.hot, boosted: !!body.boosted };
+  if (body.feePct !== undefined && body.feePct !== null && body.feePct !== "") nm.feePct = clampFeePct(body.feePct); // نسبة خاصة بهذه المباراة (وإلا تُستعمل العامة)
   await mutateState((ms) => [...ms, nm]);
   await adminLog(`إضافة مباراة ${id}`);
   return matchView(nm);
 });
 route("PATCH", "/api/admin/matches/:id", A, async ({ params, body }) => {
-  const allowed = ["hot", "boosted", "suspended", "frozen", "startsAt", "leagueId", "home", "away", "minute", "score", "status"];
+  const allowed = ["hot", "boosted", "suspended", "frozen", "startsAt", "leagueId", "home", "away", "minute", "score", "status", "feePct"];
   let out;
   await mutateState((ms) => {
     if (!findMatch(ms, params.id)) throw notFound("المباراة غير موجودة");
     return ms.map((m) => {
       if (m.id !== params.id) return m;
-      const n = { ...m }; for (const k of allowed) if (body[k] !== undefined) n[k] = k === "home" || k === "away" ? cleanTeam(body[k]) : body[k];
+      const n = { ...m }; for (const k of allowed) if (body[k] !== undefined) n[k] = k === "home" || k === "away" ? cleanTeam(body[k]) : k === "feePct" ? (body[k] === null || body[k] === "" ? null : clampFeePct(body[k])) : body[k];
       return (out = n);
     });
   });
@@ -1753,6 +1770,16 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
   await mutateState((ms) => {
     const m = findMatch(ms, params.id);
     if (!m) throw notFound("المباراة غير موجودة");
+    /* ضبط النسب المئوية مباشرةً: market = exact (17 خياراً) أو result (3 خيارات) — تُعاد موازنة المجمّع مع الإبقاء على إجماليه */
+    if (Array.isArray(body?.chances)) {
+      const result = body.market === "result", n = result ? 3 : OPT_COUNT;
+      const ch = body.chances.map((v) => Math.max(0, Number(v) || 0));
+      const sum = ch.reduce((a, b) => a + b, 0);
+      if (ch.length !== n || !(sum > 0)) throw bad("نسب غير صالحة");
+      const total = Math.max(n * 10, totalPool(result ? rPoolsOf(m) : m.pools));
+      const np = ch.map((v) => Math.max(1, +((v / sum) * total).toFixed(2)));
+      return ms.map((x) => (x.id === m.id ? (out = result ? { ...x, rPools: np } : withOdds(x, np)) : x));
+    }
     let pools = m.pools.slice();
     if (body?.reset) pools = seedPools(1.05);
     else if (body?.scale !== undefined) { const f = Math.min(10, Math.max(0.1, Number(body.scale) || 1)); pools = pools.map((p) => Math.max(1, +(p * f).toFixed(2))); }
@@ -1837,7 +1864,7 @@ route("POST", "/api/admin/import", A, async ({ body }) => {
 const CORS = {
   "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
   "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data, X-User-Id, X-Admin-Token",
+  "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data, X-User-Id, X-Admin-Token, x-apisports-key, x-rapidapi-key, x-rapidapi-host",
   "Access-Control-Max-Age": "86400",
 };
 const SEC = { "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" };
@@ -1895,11 +1922,173 @@ function serveStatic(req, res, pathname) {
   res.end(JSON.stringify({ ok: true, service: "Tawaqqo Arena API", health: "/api/health" }));
 }
 
+/* ============================ وسيط API-Sports (Football Widgets) ============================
+ * الـ Widgets الرسمية (v3.1.0) تقبل data-url-football لتوجيه كل طلباتها إلى رابطك بدل api-sports مباشرة.
+ * هنا نستقبل تلك الطلبات على /api/football/* ونضيف المفتاح من متغيّر البيئة API_FOOTBALL_KEY
+ * (ترويسة x-apisports-key) فلا يظهر المفتاح في أي ملف يصل للمتصفح.
+ * الحماية: قائمة مسارات مسموحة · GET فقط · تنقية المعاملات · حصر الدوريات في FOOTBALL_LEAGUES
+ * · كاش بالذاكرة + Cache-Control للحافة · دمج الطلبات المتزامنة · حد لكل IP وحد للطلبات الصادرة.
+ */
+const FB_HOST = (process.env.API_FOOTBALL_HOST || "https://v3.football.api-sports.io").replace(/\/+$/, "");
+const fbKey = () => process.env.API_FOOTBALL_KEY || process.env.APISPORTS_KEY || "";
+const FB_LEAGUES = (process.env.FOOTBALL_LEAGUES || "39,140").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x));
+const FB_LEAGUE_SET = new Set(FB_LEAGUES);
+const FB_ORIGINS = (process.env.FOOTBALL_ALLOWED_ORIGINS || "").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean);
+const FB_UPSTREAM_PER_MIN = Math.max(1, Number(process.env.FOOTBALL_UPSTREAM_PER_MIN) || 10);
+const FB_IP_PER_MIN = Math.max(10, Number(process.env.FOOTBALL_IP_PER_MIN) || 120);
+/* المسارات المسموحة ومدة الكاش بالثواني (الأحداث الحيّة قصيرة، والثابتة طويلة) */
+const FB_ENDPOINTS = {
+  "fixtures": 20, "fixtures/events": 20, "fixtures/lineups": 60, "fixtures/statistics": 30, "fixtures/players": 30,
+  "fixtures/headtohead": 600, "fixtures/rounds": 3600,
+  "standings": 300, "leagues": 3600, "leagues/seasons": 86400,
+  "teams": 3600, "teams/statistics": 600, "teams/seasons": 86400,
+  "players": 1800, "players/squads": 3600, "players/seasons": 86400,
+  "venues": 86400, "injuries": 600, "trophies": 86400, "sidelined": 3600, "coachs": 86400, "countries": 86400, "timezone": 86400,
+};
+const FB_PARAMS = new Set(["id", "ids", "live", "league", "season", "date", "from", "to", "team", "fixture", "round", "timezone", "status", "last", "next", "h2h", "player", "page", "search", "country", "type", "current", "name", "code", "venue", "coach"]);
+const FB_VALUE_RE = /^[\w\s.,:+\-\/]{1,100}$/;
+const fbCache = new Map();      // key -> { body, exp, ttl }
+const fbInflight = new Map();   // key -> Promise<entry>
+const fbIpHits = new Map();     // ip -> { w, n }
+const fbBudget = { w: 0, n: 0 };
+
+const fbEnvelope = (sub, errors) => ({ get: sub, parameters: [], errors, results: 0, paging: { current: 1, total: 1 }, response: [] });
+function fbSend(res, status, body, cache) {
+  const text = typeof body === "string" ? body : JSON.stringify(body);
+  const cc = cache && status === 200
+    ? `public, max-age=${Math.min(cache, 10)}, s-maxage=${cache}, stale-while-revalidate=15`
+    : "no-store";
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(text), "Cache-Control": cc, ...CORS, ...SEC });
+  res.end(text);
+}
+function fbTakeUpstreamToken() {
+  const w = Math.floor(Date.now() / 60_000);
+  if (fbBudget.w !== w) { fbBudget.w = w; fbBudget.n = 0; }
+  if (fbBudget.n >= FB_UPSTREAM_PER_MIN) return false;
+  fbBudget.n++;
+  return true;
+}
+function fbIpAllowed(req) {
+  const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "?").split(",")[0].trim();
+  const w = Math.floor(Date.now() / 60_000);
+  if (fbIpHits.size > 5000) fbIpHits.clear();
+  const h = fbIpHits.get(ip);
+  if (!h || h.w !== w) { fbIpHits.set(ip, { w, n: 1 }); return true; }
+  return ++h.n <= FB_IP_PER_MIN;
+}
+function fbOriginAllowed(req) {
+  if (!FB_ORIGINS.length) return true;
+  const origin = String(req.headers.origin || "").replace(/\/+$/, "");
+  if (origin) return FB_ORIGINS.includes(origin);
+  const ref = String(req.headers.referer || "");
+  if (ref) { try { return FB_ORIGINS.includes(new URL(ref).origin); } catch { return false; } }
+  return true;
+}
+const fbHasErrors = (j) => { const e = j?.errors; return Array.isArray(e) ? e.length > 0 : !!e && typeof e === "object" && Object.keys(e).length > 0; };
+/* حصر النتائج في الدوريات المسموحة (الدوري الإنجليزي والإسباني) */
+function fbFilterLeagues(endpoint, json) {
+  if (!["fixtures", "leagues", "standings"].includes(endpoint) || !Array.isArray(json?.response)) return json;
+  const response = json.response.filter((it) => FB_LEAGUE_SET.has(String(it?.league?.id)));
+  return { ...json, response, results: response.length };
+}
+async function fbUpstream(endpoint, qs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const r = await fetch(`${FB_HOST}/${endpoint}${qs ? "?" + qs : ""}`, { headers: { "x-apisports-key": fbKey(), Accept: "application/json" }, signal: ctrl.signal });
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch { throw new HttpError(502, "ردّ غير صالح من مزوّد البيانات"); }
+    return { status: r.status, json };
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(502, "تعذّر الوصول إلى مزوّد البيانات");
+  } finally { clearTimeout(t); }
+}
+async function fbEntry(key, endpoint, qs, ttl) {
+  const now = Date.now();
+  const hit = fbCache.get(key);
+  if (hit && hit.exp > now) return { entry: hit, state: "HIT" };
+  if (fbInflight.has(key)) return { entry: await fbInflight.get(key), state: "WAIT" };
+  const staleOk = hit && now - hit.exp < 10 * 60_000;
+  const p = (async () => {
+    if (!fbTakeUpstreamToken()) {
+      if (staleOk) return { ...hit, stale: true };
+      throw new HttpError(429, "تجاوز حدّ الطلبات مؤقتاً، حاول بعد قليل");
+    }
+    try {
+      const { status, json } = await fbUpstream(endpoint, qs);
+      if (status >= 500) { if (staleOk) return { ...hit, stale: true }; throw new HttpError(502, "مزوّد البيانات غير متاح حالياً"); }
+      if (fbHasErrors(json)) {            // أخطاء الخطة/الحد اليومي: تُمرَّر كما هي ولا تُخزَّن
+        if (staleOk) return { ...hit, stale: true };
+        return { body: JSON.stringify(json), exp: 0, ttl: 0 };
+      }
+      const entry = { body: JSON.stringify(fbFilterLeagues(endpoint, json)), exp: Date.now() + ttl * 1000, ttl };
+      if (fbCache.size > 300) fbCache.delete(fbCache.keys().next().value);
+      fbCache.set(key, entry);
+      return entry;
+    } catch (e) {
+      if (staleOk) return { ...hit, stale: true };
+      throw e;
+    }
+  })().finally(() => fbInflight.delete(key));
+  fbInflight.set(key, p);
+  return { entry: await p, state: "MISS" };
+}
+async function footballProxy(req, res, url, pathname) {
+  const sub = pathname.replace(/^\/api\/football\/?/, "").replace(/\/+$/, "");
+  try {
+    if (req.method !== "GET") return fbSend(res, 405, fbEnvelope(sub, { method: "GET فقط" }));
+    if (!fbOriginAllowed(req)) return fbSend(res, 403, fbEnvelope(sub, { origin: "أصل غير مسموح" }));
+    if (!fbIpAllowed(req)) return fbSend(res, 429, fbEnvelope(sub, { rateLimit: "طلبات كثيرة، حاول بعد قليل" }));
+
+    if (sub === "health") return fbSend(res, 200, { ok: true, configured: !!fbKey(), leagues: FB_LEAGUES });
+    if (sub === "_status") {   // للأدمن فقط: حالة الخطة والحد اليومي (بدون إظهار المفتاح أو بيانات الحساب)
+      if (!verifyAdminToken(req.headers["x-admin-token"])) return fbSend(res, 401, { ok: false, error: "يلزم تسجيل الدخول كمدير" });
+      if (!fbKey()) return fbSend(res, 200, { ok: true, keyConfigured: false });
+      const { json } = await fbUpstream("status", "");
+      const r = json?.response || {};
+      return fbSend(res, 200, { ok: true, keyConfigured: true, plan: r.subscription?.plan ?? null, active: r.subscription?.active ?? null, requests: r.requests ?? null, errors: json?.errors ?? [] });
+    }
+
+    const ttl = FB_ENDPOINTS[sub];
+    if (!ttl) return fbSend(res, 404, fbEnvelope(sub, { endpoint: "مسار غير مسموح" }));
+    if (!fbKey()) return fbSend(res, 503, fbEnvelope(sub, { server: "API_FOOTBALL_KEY غير مضبوط في السيرفر" }));
+
+    /* تنقية المعاملات (قائمة بيضاء + حدود الطول) */
+    const params = new URLSearchParams();
+    for (const [k, v] of url.searchParams) {
+      if (!FB_PARAMS.has(k) || !FB_VALUE_RE.test(v)) continue;
+      params.set(k, v);
+    }
+    /* حصر الدوريات */
+    const leagueTokens = (v) => String(v).split(/[-,]/).filter(Boolean);
+    if (params.has("league") && !leagueTokens(params.get("league")).every((t) => FB_LEAGUE_SET.has(t)))
+      return fbSend(res, 403, fbEnvelope(sub, { league: "دوري غير مسموح" }));
+    if (sub === "standings" && !params.has("league")) return fbSend(res, 403, fbEnvelope(sub, { league: "league مطلوب" }));
+    if (sub === "fixtures" && params.has("live")) {
+      const lv = params.get("live");
+      if (lv === "all") params.set("live", FB_LEAGUES.join("-"));
+      else if (!leagueTokens(lv).every((t) => FB_LEAGUE_SET.has(t))) return fbSend(res, 403, fbEnvelope(sub, { live: "دوري غير مسموح" }));
+    }
+    params.sort();
+    const qs = params.toString();
+    const { entry, state } = await fbEntry(`${sub}?${qs}`, sub, qs, ttl);
+    res.setHeader("X-Football-Cache", entry.stale ? "STALE" : state);
+    return fbSend(res, 200, entry.body, entry.exp > Date.now() ? Math.max(5, Math.min(ttl, Math.ceil((entry.exp - Date.now()) / 1000))) : 0);
+  } catch (e) {
+    const status = e instanceof HttpError ? e.status : 500;
+    if (status === 500) console.error(`✖ football ${req.url}:`, e);
+    return fbSend(res, status, fbEnvelope(sub, { proxy: status === 500 ? "خطأ داخلي في الخادم" : e.message }));
+  }
+}
+
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
     if (req.method === "OPTIONS") { res.writeHead(204, CORS); return res.end(); }
+    if (pathname === "/api/football" || pathname.startsWith("/api/football/")) return await footballProxy(req, res, url, pathname);
     if (!pathname.startsWith("/api/") && pathname !== "/api") {
       if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, SEC); return res.end(); }
       return serveStatic(req, res, pathname);
