@@ -285,7 +285,7 @@ const PUBLIC = path.join(__dirname, "public");
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const ADMIN_PIN = process.env.ADMIN_PIN || "123456";
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
-const BOT_USERNAME = process.env.BOT_USERNAME || "TawaqqoArenaBot";
+const BOT_USERNAME = process.env.BOT_USERNAME || "Sporfiabot";
 // نسب العمولة على مبلغ كل رهان: المستوى 1 = 10% ، المستوى 2 = 5% ، المستوى 3 = 3% (قابلة للتعديل عبر REF_RATES="0.10,0.05,0.03")
 const REF_RATES = (process.env.REF_RATES || "0.10,0.05,0.03").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0).concat([0, 0, 0]).slice(0, 3);
 const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // مكافأة الداعي عن كل صديق مؤهَّل (تُمنح مرة واحدة عند التأهيل فقط)
@@ -1286,11 +1286,11 @@ route("GET", "/api/referrals", async ({ user }) => {
   const earned = r2(list.reduce((a, r) => a + r.commissionEarned, 0));
   const code = inviteCodeOf(user._id);
   return {
-    code, link: `https://t.me/${BOT_USERNAME}/app?start=ref_${code}`, referrals: list,
+    code, link: `https://t.me/${BOT_USERNAME}/app?startapp=ref_${code}`, referrals: list,
     totalEarned: earned, claimed: r2(user.claimedCommission || 0), pending: r2(Math.max(0, earned - (user.claimedCommission || 0))),
   };
 });
-route("GET", "/api/referrals/link", ({ user }) => ({ link: `https://t.me/${BOT_USERNAME}/app?start=ref_${inviteCodeOf(user._id)}` }));
+route("GET", "/api/referrals/link", ({ user }) => ({ link: `https://t.me/${BOT_USERNAME}/app?startapp=ref_${inviteCodeOf(user._id)}` }));
 route("POST", "/api/referrals/claim", async ({ user, cfg }) => {
   assertActive(user, cfg);
   if (!cfg.settings.commissionEnabled) throw forbid("العمولة متوقفة");
