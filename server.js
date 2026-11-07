@@ -444,7 +444,19 @@ const newUser = (id, name = "لاعبنا", avatar = "🎯") => ({
   limits: { dailyLossLimit: 0, maxStake: 0, selfExcludedUntil: null },
   claimedCommission: 0, referredBy: null, lastBonusAt: 0,
 });
-const inviteCodeOf = (id) => `TQ${(Number(id) * 7 + 90001).toString(36).toUpperCase()}`;
+// كود الدعوة = معرف حساب تيليجرام نفسه (رقم)، فيُربط الداعي مباشرة بلا بحث ولا حدّ 5000 مستخدم
+const inviteCodeOf = (id) => String(Number(id));
+// يستخرج معرف الداعي من الكود: يقبل المعرف الرقمي الجديد، ويفكّ الأكواد القديمة (TQxxxx) كي لا تبطل الروابط المنشورة سابقاً
+function inviterIdFromCode(raw) {
+  const code = String(raw || "").trim().replace(/^ref_/i, "");
+  if (/^\d{4,15}$/.test(code)) return Number(code);
+  const m = code.match(/^TQ([0-9A-Z]+)$/i);
+  if (m) {
+    const n = (parseInt(m[1], 36) - 90001) / 7;
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return null;
+}
 function vipOf(xp, cfg) {
   const tiers = cfg.vipTiers;
   let idx = 0;
@@ -960,7 +972,10 @@ route("POST", "/api/telegram/webhook", { auth: false, sync: false }, async ({ re
     // /start و/start@BotName و/start ref_xxx كلها تُظهر الترحيب
     if (msg?.chat?.type === "private" && /^\/start(@\w+)?(\s|$)/i.test(text)) {
       const ref = text.match(/^\/start(?:@\w+)?\s+ref_(\S+)/i);
-      if (ref && msg.from?.id) await savePendingRef(msg.from.id, ref[1]).catch((e) => console.error("savePendingRef:", e?.message || e));
+      if (ref && msg.from?.id) {
+        console.log(`referral: /start من ${msg.from.id} بكود ${ref[1]}`);
+        await savePendingRef(msg.from.id, ref[1]).catch((e) => console.error("savePendingRef:", e?.message || e));
+      }
       await sendWelcome(msg.chat.id);
     }
   } catch (e) {
@@ -973,8 +988,11 @@ route("POST", "/api/telegram/webhook", { auth: false, sync: false }, async ({ re
 async function attachReferral(user, code) {
   if (user.referredBy || !code) return;
   const { users, refs } = await C();
-  const inviter = (await users.find({}).limit(5000).toArray()).find((u) => inviteCodeOf(u._id) === code);
-  if (!inviter || inviter._id === user._id) return;
+  const inviterId = inviterIdFromCode(code);
+  if (!inviterId) { console.error(`referral: كود غير صالح "${code}" للمستخدم ${user._id}`); return; }
+  if (inviterId === user._id) { console.error(`referral: المستخدم ${user._id} حاول دعوة نفسه`); return; }
+  const inviter = await users.findOne({ _id: inviterId });
+  if (!inviter) { console.error(`referral: الداعي ${inviterId} غير موجود (لم يفتح التطبيق بعد)`); return; }
   // منع الحلقات: لا يُقبل داعٍ يكون المستخدم نفسه من أسلافه (3 مستويات)
   let up = inviter._id;
   for (let i = 0; i < 3 && up; i++) {
@@ -988,7 +1006,8 @@ async function attachReferral(user, code) {
   try {
     await refs.insertOne({ _id: `r${uid()}`, inviterId: inviter._id, userId: user._id, name: user.name, avatar: user.avatar, joinedAt: Date.now(), wagered: 0, commissionEarned: 0, active: false, qualified: false });
     await addNotice(inviter._id, { title: "👥 صديق جديد انضم", body: `${user.name} انضم عبر رابط دعوتك.`, tone: "info" });
-  } catch { /* مُحال مسبقاً */ }
+    console.log(`referral: تم ربط ${user._id} بالداعي ${inviter._id}`);
+  } catch (e) { console.error("referral insert:", e?.message || e); /* مُحال مسبقاً */ }
 }
 /* إحالة معلّقة: تُحفظ عند ضغط الصديق Start في البوت (/start ref_CODE) وتُربط بحسابه عند أول دخول للتطبيق.
  * بهذا لا تعتمد الإحالة على طريقة فتح التطبيق (start_param) ولا على الاسم المختصر للتطبيق في BotFather. */
