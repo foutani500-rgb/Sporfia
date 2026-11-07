@@ -69,7 +69,7 @@ const oddsOf = (pools, i, boosted = false, fee = FEE_NOW) => {
     if (p <= 0)
         return 1.01;
     const base = (totalPool(pools) * (1 - fee)) / p;
-    return Math.max(1.01, boosted ? base * 1.15 : base);
+    return Math.max(1.01, base); // لا مضاعف: سعر المجمّع فقط (boosted متروك للتوافق ولا أثر له)
 };
 /** السعر بعد إضافة رهان جديد — ما سيراه المستخدم فعلياً */
 const oddsAfter = (pools, i, stake, boosted = false, fee = FEE_NOW) => {
@@ -317,7 +317,14 @@ const DEFAULT_SETTINGS = {
   liveCutoffMin: 85,        // آخر دقيقة يُسمح فيها بالرهان الحي (90 = حتى النهاية)
   goalPauseSec: 30,         // إيقاف الرهان لحظات بعد كل هدف (حماية من تأخر البيانات)
   realMatchesEnabled: true, // جلب المباريات الحقيقية من API-Sports
-  realSyncSec: 60,          // كل كم ثانية نحدّث المباريات النشطة (يستهلك من حصة API)
+  realSyncSec: 10,          // كل كم ثانية نحدّث المباريات النشطة (يستهلك من حصة API) — الافتراضي 10 ث
+  /* ===== محرّك النسب الحية (٪) — يتحكم بنسب كل المباريات الحية حسب سير المباراة ===== */
+  liveRatesEnabled: true,   // تشغيل التسعير التلقائي للمباريات الحية
+  liveRateMin: 0.1,         // أدنى نسبة ٪ (للنتيجة المستحيلة/المنتهية)
+  liveRateMax: 20,          // أعلى نسبة ٪ لأي نتيجة دقيقة (للنتيجة المرجّحة) — تُرفع تلقائياً إذا لم تسمح الحسابات
+  liveRateSpeed: 1,         // حساسية الدقيقة: أعلى = تتغير النسب أسرع مع مرور الوقت (0.5 – 3)
+  liveRateGoalAvg: 2.7,     // معدل أهداف المباراة الكاملة المتوقّع (يؤثر على سرعة تغيّر النسب بعد الأهداف)
+  liveRateNoisePct: 3,      // حركة عشوائية خفيفة كل 10 ثوانٍ (0 = بلا حركة)
   showSimMatches: true,     // إظهار مباريات الساحة التجريبية بجانب الحقيقية
   minStake: 1, maxStake: 0, cashoutMarginPct: 0,
   platformFeePct: 0, // نسبة ربح المنصة المخصومة من مجمّع كل مباراة (0..50) — الافتراضي 0%، وتُعدَّل من لوحة الأدمن
@@ -408,8 +415,13 @@ async function getConfig(force = false) {
     await meta.updateOne({ _id: "config" }, { $set: { "settings.liveBetting": true, "settings.liveMigrated": true } });
     doc.settings = { ...(doc.settings || {}), liveBetting: true, liveMigrated: true };
   }
+  if (!doc.settings?.sync10Migrated) {   // ترحيل لمرة واحدة: التحديث كل 10 ثوانٍ بدل 15/60
+    await meta.updateOne({ _id: "config" }, { $set: { "settings.realSyncSec": 10, "settings.sync10Migrated": true } });
+    doc.settings = { ...(doc.settings || {}), realSyncSec: 10, sync10Migrated: true };
+  }
   doc.settings = { ...DEFAULT_SETTINGS, ...(doc.settings || {}), announcement: { ...DEFAULT_SETTINGS.announcement, ...(doc.settings?.announcement || {}) } };
   FEE_NOW = clampFeePct(doc.settings.platformFeePct, FEE * 100) / 100;
+  LIVE_NOW = doc.settings;
   cfgCache = { at: Date.now(), doc };
   return doc;
 }
@@ -542,7 +554,7 @@ async function syncReal(cfg, force = false) {
   if (s.realMatchesEnabled === false || !fbKey() || (s.simPaused && !force)) return { skipped: true };
   const { state } = await C();
   const now = Date.now();
-  const gap = force ? 0 : Math.max(15, Number(s.realSyncSec) || 60) * 1000;
+  const gap = force ? 0 : Math.max(10, Number(s.realSyncSec) || 10) * 1000;
   const claim = await state.updateOne({ _id: "matches", $or: [{ realAt: { $lt: now - gap } }, { realAt: { $exists: false } }] }, { $set: { realAt: now } });
   if (claim.modifiedCount !== 1) return { skipped: true };
   const st = await loadState();
@@ -658,22 +670,87 @@ const matchViewBase = (m) => ({
   effFeePct: +(feeOf(m) * 100).toFixed(2), // النسبة المطبّقة فعلياً على هذه المباراة (الخاصة أو العامة)
   progress: +matchProgress(m).toFixed(3),
 });
-/* أسعار فعّالة للمباراة الحقيقية الحية: مزج أموال اللاعبين بنموذج احتمالات يعتمد النتيجة والدقيقة */
+/* ====================== محرّك النسب الحية (٪) ======================
+ * النسبة الظاهرة لكل نتيجة = حصتها من المجمّع. أثناء المباراة الحية تُحسب الحصة من احتمال النتيجة النهائية
+ * (النتيجة الحالية + الدقيقة)، فتتحرك مع الأهداف ومرور الوقت: المستحيلة/المنتهية → الحد الأدنى،
+ * والمرجّحة ترتفع حتى الحد الأعلى. الدفع يبقى بنظام المجمّع نفسه (لا مضاعفات إضافية).
+ * ضبط يدوي (manualPrices) من لوحة الأدمن يوقف التسعير التلقائي لتلك المباراة حتى "العودة للتلقائي". */
+let LIVE_NOW = DEFAULT_SETTINGS;
+const clampN = (v, lo, hi, fb) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fb; };
+const poissonPmf = (k, l) => { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l / i; return p; };
+/** يوزّع النسب (مجموعها 100) مع أرضية وسقف لكل خيار */
+function shapeShares(probs, lo, hi) {
+  const n = probs.length, alive = probs.filter((p) => p > 0.0005).length || 1;
+  const cap = Math.max(hi, 100 / alive, lo);
+  const sumP = probs.reduce((a, b) => a + b, 0) || 1;
+  const p = probs.map((v) => Math.max(0, v) / sumP);
+  const fixed = new Array(n).fill(null);
+  for (let it = 0; it < 40; it++) {
+    const free = [], fixedSum = fixed.reduce((a, v) => a + (v ?? 0), 0);
+    for (let i = 0; i < n; i++) if (fixed[i] === null) free.push(i);
+    if (!free.length) break;
+    const rem = 100 - fixedSum, sf = free.reduce((a, i) => a + p[i], 0);
+    const t = free.map((i) => (sf > 0 ? (p[i] / sf) * rem : rem / free.length));
+    let changed = false;
+    free.forEach((i, k) => { if (t[k] < lo) { fixed[i] = lo; changed = true; } else if (t[k] > cap) { fixed[i] = cap; changed = true; } });
+    if (!changed) { free.forEach((i, k) => { fixed[i] = t[k]; }); break; }
+  }
+  const out = fixed.map((v, i) => (v === null ? lo : v));
+  const tot = out.reduce((a, b) => a + b, 0) || 1;
+  return out.map((v) => (v / tot) * 100);
+}
+/** النتائج الدقيقة المستحيلة الآن (أقل من النتيجة الحالية) */
+const deadOf = (m) => {
+  if (m.real) return deadExact(m.score);
+  return SCORES.map((_, i) => i < OPT_COUNT - 1 && (Math.floor(i / 4) < m.score[0] || (i % 4) < m.score[1]));
+};
+const liveEngineOn = (m) => LIVE_NOW.liveRatesEnabled !== false && m.status === "live" && !m.manualPrices;
+/** نسب (٪) النتائج الدقيقة الـ17 ونتيجة المباراة الثلاث لمباراة حية */
+function liveShares(m) {
+  const S = LIVE_NOW;
+  const lo = clampN(S.liveRateMin, 0.01, 5, 0.1), hi = clampN(S.liveRateMax, 5, 100, 20);
+  const speed = clampN(S.liveRateSpeed, 0.3, 4, 1), avg = clampN(S.liveRateGoalAvg, 0.5, 8, 2.7);
+  const left = Math.pow(Math.max(0, 90 - Math.min(90, m.minute || 0)) / 90, speed);
+  const lh = avg * 0.54 * left, la = avg * 0.46 * left;
+  const [s0, s1] = m.score || [0, 0];
+  const probs = new Array(OPT_COUNT).fill(0);
+  const bucket = Math.floor(Date.now() / 10_000), noise = clampN(S.liveRateNoisePct, 0, 20, 3) / 100;
+  for (let i = 0; i <= 9; i++) for (let j = 0; j <= 9; j++) {
+    const h = s0 + i, a = s1 + j, pr = poissonPmf(i, lh) * poissonPmf(j, la);
+    probs[h <= 3 && a <= 3 ? h * 4 + a : OPT_COUNT - 1] += pr;
+  }
+  const noisy = probs.map((v, i) => (v > 0 ? v * (1 + (seededRand(`${m.id}:${i}:${bucket}`) - 0.5) * 2 * noise) : 0));
+  const exact = shapeShares(noisy, lo, hi);   // السقف (liveRateMax) يُطبَّق على النتائج الدقيقة فقط
+  const r = [0, 0, 0];   // سوق النتيجة (فوز/تعادل/فوز) يُحسب من الاحتمالات الفعلية بلا سقف حتى يبقى واقعياً
+  for (let h = 0; h < 4; h++) for (let a = 0; a < 4; a++) r[h > a ? 0 : h === a ? 1 : 2] += noisy[h * 4 + a];
+  for (let i = 0; i <= 9; i++) for (let j = 0; j <= 9; j++) {
+    const h = s0 + i, a = s1 + j;
+    if (!(h <= 3 && a <= 3)) r[h > a ? 0 : h === a ? 1 : 2] += poissonPmf(i, lh) * poissonPmf(j, la);
+  }
+  const res = shapeShares(r.map((v) => v), lo, 100);
+  return { exact, res };
+}
+const sharesToPools = (shares, total) => shares.map((v) => +((v / 100) * total).toFixed(4));
+/* أسعار فعّالة للمباراة الحية: نسب المحرّك (إن فُعّل) وإلا نموذج المباريات الحقيقية */
 function epFor(m, pools, kind) {
+  if (liveEngineOn(m)) {
+    const sh = liveShares(m);
+    return sharesToPools(kind === "res" ? sh.res : sh.exact, Math.max(100, totalPool(pools)));
+  }
   if (!(m.real && m.status === "live")) return pools;
   const d = liveDist(m.score, m.minute);
   return effPools(pools, kind === "res" ? d.res : d.exact, m.minute, true);
 }
 const matchView = (m) => {
   const v = matchViewBase(m);
-  if (!m.real) return v;
   const live = m.status === "live";
+  if (!m.real && !liveEngineOn(m)) return live ? { ...v, dead: deadOf(m) } : v;
   const exact = epFor(m, m.pools, "exact"), res = epFor(m, rPoolsOf(m), "res");
   return {
     ...v, pools: exact, rPools: res,
     odds: exact.map((_, i) => +oddsOf(exact, i, m.boosted, feeOf(m)).toFixed(3)), chances: exact.map((_, i) => +chanceOf(exact, i).toFixed(4)),
     rOdds: res.map((_, i) => +oddsOf(res, i, m.boosted, feeOf(m)).toFixed(3)), rChances: res.map((_, i) => +chanceOf(res, i).toFixed(4)),
-    dead: live ? deadExact(m.score) : null, suspendUntil: m.suspendUntil || 0,
+    dead: live ? deadOf(m) : null, suspendUntil: m.suspendUntil || 0,
   };
 };
 const withOdds = (m, pools) => ({
@@ -849,7 +926,7 @@ route("GET", "/api/ticker", PUBLIC_R, ({ matches }) => ({
   at: Date.now(),
   matches: matches.map((m) => ({
     id: m.id, status: m.status, minute: m.minute, score: m.score,
-    odds: m.pools.map((_, i) => +oddsOf(m.pools, i, m.boosted, feeOf(m)).toFixed(3)), totalPool: Math.round(totalPool(m.pools)),
+    odds: epFor(m, m.pools, "exact").map((_, i, ep) => +oddsOf(ep, i, m.boosted, feeOf(m)).toFixed(3)), totalPool: Math.round(totalPool(m.pools)),
   })),
 }));
 route("GET", "/api/matches/:id", PUBLIC_R, ({ params, matches }) => {
@@ -1047,7 +1124,7 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       const m = findMatch(ms, m0.id);
       if (!m) throw bad("المباراة غير متوفرة");
       checkMatch(m);
-      if (market === "exact" && m.real && m.status === "live" && deadExact(m.score)[optIndex]) throw bad("هذه النتيجة لم تعد ممكنة");
+      if (market === "exact" && m.status === "live" && deadOf(m)[optIndex]) throw bad("هذه النتيجة لم تعد ممكنة");
       matchLabel = `${m.home.name} × ${m.away.name}`;
       boosted = m.boosted;
       if (market === "result") {
@@ -1295,6 +1372,7 @@ route("PUT", "/api/admin/settings", A, async ({ body, cfg }) => {
   if (keys.includes("platformFeePct")) settings.platformFeePct = clampFeePct(settings.platformFeePct, 0);
   await saveConfig({ settings });
   if (keys.includes("platformFeePct")) FEE_NOW = settings.platformFeePct / 100;
+  LIVE_NOW = settings;
   await adminLog(`إعدادات: ${keys.join("، ")}`);
   return settings;
 });
@@ -1705,15 +1783,20 @@ route("GET", "/api/admin/bets", A, async ({ query }) => {
   return (await bets.find(f).sort({ createdAt: -1 }).limit(Math.min(Number(query.limit) || 1000, 5000)).toArray()).map((b) => pub(b, true));
 });
 /* ---- تعويض خاسري مباراة: إعادة مبلغ رهانات الخاسرين (كلياً أو بنسبة) لمرة واحدة لكل رهان ---- */
-route("GET", "/api/admin/matches/:id/compensation", A, async ({ params }) => {
+const lostFilter = (matchId, src) => {
+  const f = { matchId, status: "lost", compensated: { $ne: true } };
+  if (src?.pick) { f.pick = String(src.pick); f.market = src.market === "result" ? "result" : "exact"; }   // تعويض نتيجة واحدة فقط
+  return f;
+};
+route("GET", "/api/admin/matches/:id/compensation", A, async ({ params, query }) => {
   const { bets } = await C();
-  const list = await bets.find({ matchId: params.id, status: "lost", compensated: { $ne: true } }).toArray();
+  const list = await bets.find(lostFilter(params.id, query)).toArray();
   return { count: list.length, players: new Set(list.map((b) => b.userId)).size, totalStake: r2(list.reduce((a, b) => a + b.stake, 0)) };
 });
 route("POST", "/api/admin/matches/:id/compensate", A, async ({ params, body }) => {
   const percent = Math.min(100, Math.max(1, Number(body?.percent) || 100));
   const { bets } = await C();
-  const list = await bets.find({ matchId: params.id, status: "lost", compensated: { $ne: true } }).toArray();
+  const list = await bets.find(lostFilter(params.id, body)).toArray();
   let count = 0, total = 0;
   const players = new Set();
   for (const b of list) {
@@ -1725,7 +1808,7 @@ route("POST", "/api/admin/matches/:id/compensate", A, async ({ params, body }) =
     await addNotice(b.userId, { title: "🎁 تعويض خسارة", body: `تم تعويضك $${amount} عن رهانك في ${b.matchLabel}.`, tone: "gold" });
     count++; total += amount; players.add(b.userId);
   }
-  await adminLog(`تعويض خاسري المباراة ${params.id}: ${count} رهان · $${r2(total)} · ${percent}%`);
+  await adminLog(`تعويض خاسري المباراة ${params.id}${body?.pick ? ` (نتيجة ${body.pick})` : ""}: ${count} رهان · $${r2(total)} · ${percent}%`);
   return { ok: true, compensated: count, players: players.size, total: r2(total) };
 });
 route("POST", "/api/admin/bets/:id/settle", A, async ({ params, body }) => {
@@ -1880,8 +1963,9 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
       if (ch.length !== n || !(sum > 0)) throw bad("نسب غير صالحة");
       const total = Math.max(n * 10, totalPool(result ? rPoolsOf(m) : m.pools));
       const np = ch.map((v) => Math.max(1, +((v / sum) * total).toFixed(2)));
-      return ms.map((x) => (x.id === m.id ? (out = result ? { ...x, rPools: np } : withOdds(x, np)) : x));
+      return ms.map((x) => (x.id === m.id ? (out = result ? { ...x, rPools: np, manualPrices: true } : { ...withOdds(x, np), manualPrices: true }) : x));
     }
+    if (body?.auto) return ms.map((x) => (x.id === m.id ? (out = { ...x, manualPrices: false }) : x));   // عودة للتسعير التلقائي
     let pools = m.pools.slice();
     if (body?.reset) pools = seedPools(1.05);
     else if (body?.scale !== undefined) { const f = Math.min(10, Math.max(0.1, Number(body.scale) || 1)); pools = pools.map((p) => Math.max(1, +(p * f).toFixed(2))); }
@@ -1890,10 +1974,17 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
       if (!Number.isInteger(i) || i < 0 || i >= OPT_COUNT) throw bad("خيار غير صالح");
       pools[i] = body.value !== undefined ? Math.max(1, Number(body.value) || 1) : Math.max(1, pools[i] + (Number(body.delta) || 0));
     }
-    return ms.map((x) => (x.id === m.id ? (out = withOdds(x, pools)) : x));
+    return ms.map((x) => (x.id === m.id ? (out = { ...withOdds(x, pools), manualPrices: body?.reset ? false : true }) : x));
   });
   await adminLog(`تعديل مجمّعات المباراة ${params.id}`);
   return matchView(out);
+});
+/* إعادة كل المباريات الحية للتسعير التلقائي (النسب تتبع سير المباراة من جديد) */
+route("POST", "/api/admin/matches/auto-prices", A, async () => {
+  let n = 0;
+  await mutateState((ms) => ms.map((x) => { if (x.manualPrices) { n++; return { ...x, manualPrices: false }; } return x; }));
+  await adminLog(`إعادة ${n} مباراة للتسعير التلقائي`);
+  return { ok: true, count: n };
 });
 route("POST", "/api/admin/matches/flags", A, async ({ body }) => {
   const flag = body?.flag;
