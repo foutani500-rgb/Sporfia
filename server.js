@@ -78,7 +78,7 @@ const oddsAfter = (pools, i, stake, boosted = false, fee = FEE_NOW) => {
     return oddsOf(pools2, i, boosted, fee);
 };
 /** مكافأة السلسلة: +2% لكل فوز متتالٍ حتى +10% */
-const streakBonus = (streak) => Math.min(Math.max(streak, 0), 5) * 0.02;
+const streakBonus = (_streak) => 0; // لا مكافآت إضافية على الربح: الربح = النسبة المعروضة فقط
 /** عشوائية مستقرة من بذرة نصية — لضمان ثبات القيمة بين الاستدعاءات المتقاربة */
 function seededRand(seed) {
     let h = 2166136261;
@@ -319,9 +319,9 @@ const DEFAULT_SETTINGS = {
   realMatchesEnabled: true, // جلب المباريات الحقيقية من API-Sports
   realSyncSec: 10,          // كل كم ثانية نحدّث المباريات النشطة (يستهلك من حصة API) — الافتراضي 10 ث
   /* ===== محرّك النسب الحية (٪) — يتحكم بنسب كل المباريات الحية حسب سير المباراة ===== */
-  liveRatesEnabled: true,   // تشغيل التسعير التلقائي للمباريات الحية
-  liveRateMin: 0.1,         // أدنى نسبة ٪ (للنتيجة المستحيلة/المنتهية)
-  liveRateMax: 20,          // أعلى نسبة ٪ لأي نتيجة دقيقة (للنتيجة المرجّحة) — تُرفع تلقائياً إذا لم تسمح الحسابات
+  liveRatesEnabled: true,   // تسعير النسب تلقائياً حسب سير المباراة (إيقافه = النسبة من أموال اللاعبين)
+  liveRateMin: 0.1,         // أدنى نسبة ربح ٪ (للنتيجة المضمونة)
+  liveRateMax: 20,          // أعلى نسبة ربح ٪ (للنتيجة المستحيلة/شبه المستحيلة) — رهان 100$ بنسبة 20 يدفع 120$
   liveRateSpeed: 1,         // حساسية الدقيقة: أعلى = تتغير النسب أسرع مع مرور الوقت (0.5 – 3)
   liveRateGoalAvg: 2.7,     // معدل أهداف المباراة الكاملة المتوقّع (يؤثر على سرعة تغيّر النسب بعد الأهداف)
   liveRateNoisePct: 3,      // حركة عشوائية خفيفة كل 10 ثوانٍ (0 = بلا حركة)
@@ -670,87 +670,62 @@ const matchViewBase = (m) => ({
   effFeePct: +(feeOf(m) * 100).toFixed(2), // النسبة المطبّقة فعلياً على هذه المباراة (الخاصة أو العامة)
   progress: +matchProgress(m).toFixed(3),
 });
-/* ====================== محرّك النسب الحية (٪) ======================
- * النسبة الظاهرة لكل نتيجة = حصتها من المجمّع. أثناء المباراة الحية تُحسب الحصة من احتمال النتيجة النهائية
- * (النتيجة الحالية + الدقيقة)، فتتحرك مع الأهداف ومرور الوقت: المستحيلة/المنتهية → الحد الأدنى،
- * والمرجّحة ترتفع حتى الحد الأعلى. الدفع يبقى بنظام المجمّع نفسه (لا مضاعفات إضافية).
- * ضبط يدوي (manualPrices) من لوحة الأدمن يوقف التسعير التلقائي لتلك المباراة حتى "العودة للتلقائي". */
+/* ====================== نظام النسب (٪) — الربح بالنسبة المئوية فقط ======================
+ * النسبة المعروضة لكل نتيجة = صافي الربح من مبلغ الرهان، بين liveRateMin (0.1%) و liveRateMax (20%).
+ * رهان 100$ بنسبة 20% → يُدفع 120$ (ربح 20$). لا مضاعفات ولا مكافآت إضافية.
+ * النتيجة المستحيلة/شبه المستحيلة = الحد الأعلى، والمضمونة = الحد الأدنى، وتتحرك مع النتيجة والدقيقة.
+ * الضبط اليدوي من الأدمن (manualRates) يثبّت نسب سوق معيّن حتى "العودة للتلقائي". */
 let LIVE_NOW = DEFAULT_SETTINGS;
 const clampN = (v, lo, hi, fb) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fb; };
 const poissonPmf = (k, l) => { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l / i; return p; };
-/** يوزّع النسب (مجموعها 100) مع أرضية وسقف لكل خيار */
-function shapeShares(probs, lo, hi) {
-  const n = probs.length, alive = probs.filter((p) => p > 0.0005).length || 1;
-  const cap = Math.max(hi, 100 / alive, lo);
-  const sumP = probs.reduce((a, b) => a + b, 0) || 1;
-  const p = probs.map((v) => Math.max(0, v) / sumP);
-  const fixed = new Array(n).fill(null);
-  for (let it = 0; it < 40; it++) {
-    const free = [], fixedSum = fixed.reduce((a, v) => a + (v ?? 0), 0);
-    for (let i = 0; i < n; i++) if (fixed[i] === null) free.push(i);
-    if (!free.length) break;
-    const rem = 100 - fixedSum, sf = free.reduce((a, i) => a + p[i], 0);
-    const t = free.map((i) => (sf > 0 ? (p[i] / sf) * rem : rem / free.length));
-    let changed = false;
-    free.forEach((i, k) => { if (t[k] < lo) { fixed[i] = lo; changed = true; } else if (t[k] > cap) { fixed[i] = cap; changed = true; } });
-    if (!changed) { free.forEach((i, k) => { fixed[i] = t[k]; }); break; }
-  }
-  const out = fixed.map((v, i) => (v === null ? lo : v));
-  const tot = out.reduce((a, b) => a + b, 0) || 1;
-  return out.map((v) => (v / tot) * 100);
-}
+const rateBounds = () => {
+  const lo = clampN(LIVE_NOW.liveRateMin, 0, 50, 0.1);
+  return { lo, hi: Math.max(lo, clampN(LIVE_NOW.liveRateMax, 0.1, 100, 20)) };
+};
 /** النتائج الدقيقة المستحيلة الآن (أقل من النتيجة الحالية) */
 const deadOf = (m) => {
   if (m.real) return deadExact(m.score);
   return SCORES.map((_, i) => i < OPT_COUNT - 1 && (Math.floor(i / 4) < m.score[0] || (i % 4) < m.score[1]));
 };
-const liveEngineOn = (m) => LIVE_NOW.liveRatesEnabled !== false && m.status === "live" && !m.manualPrices;
-/** نسب (٪) النتائج الدقيقة الـ17 ونتيجة المباراة الثلاث لمباراة حية */
-function liveShares(m) {
-  const S = LIVE_NOW;
-  const lo = clampN(S.liveRateMin, 0.01, 5, 0.1), hi = clampN(S.liveRateMax, 5, 100, 20);
+/** احتمالات النتيجة النهائية: دقيقة (17) ونتيجة المباراة (3) — من النتيجة الحالية والدقيقة */
+function matchProbs(m) {
+  if (LIVE_NOW.liveRatesEnabled === false) {   // التلقائي متوقف: الاحتمال = حصة الخيار من أموال اللاعبين
+    const rp = rPoolsOf(m);
+    return { exact: m.pools.map((_, i) => chanceOf(m.pools, i)), res: rp.map((_, i) => chanceOf(rp, i)) };
+  }
+  const S = LIVE_NOW, live = m.status === "live";
   const speed = clampN(S.liveRateSpeed, 0.3, 4, 1), avg = clampN(S.liveRateGoalAvg, 0.5, 8, 2.7);
-  const left = Math.pow(Math.max(0, 90 - Math.min(90, m.minute || 0)) / 90, speed);
+  const left = Math.pow(Math.max(0, 90 - (live ? Math.min(90, m.minute || 0) : 0)) / 90, speed);
   const lh = avg * 0.54 * left, la = avg * 0.46 * left;
-  const [s0, s1] = m.score || [0, 0];
-  const probs = new Array(OPT_COUNT).fill(0);
+  const [s0, s1] = live ? (m.score || [0, 0]) : [0, 0];
   const bucket = Math.floor(Date.now() / 10_000), noise = clampN(S.liveRateNoisePct, 0, 20, 3) / 100;
+  const exact = new Array(OPT_COUNT).fill(0), res = [0, 0, 0];
   for (let i = 0; i <= 9; i++) for (let j = 0; j <= 9; j++) {
     const h = s0 + i, a = s1 + j, pr = poissonPmf(i, lh) * poissonPmf(j, la);
-    probs[h <= 3 && a <= 3 ? h * 4 + a : OPT_COUNT - 1] += pr;
+    exact[h <= 3 && a <= 3 ? h * 4 + a : OPT_COUNT - 1] += pr;
+    res[h > a ? 0 : h === a ? 1 : 2] += pr;
   }
-  const noisy = probs.map((v, i) => (v > 0 ? v * (1 + (seededRand(`${m.id}:${i}:${bucket}`) - 0.5) * 2 * noise) : 0));
-  const exact = shapeShares(noisy, lo, hi);   // السقف (liveRateMax) يُطبَّق على النتائج الدقيقة فقط
-  const r = [0, 0, 0];   // سوق النتيجة (فوز/تعادل/فوز) يُحسب من الاحتمالات الفعلية بلا سقف حتى يبقى واقعياً
-  for (let h = 0; h < 4; h++) for (let a = 0; a < 4; a++) r[h > a ? 0 : h === a ? 1 : 2] += noisy[h * 4 + a];
-  for (let i = 0; i <= 9; i++) for (let j = 0; j <= 9; j++) {
-    const h = s0 + i, a = s1 + j;
-    if (!(h <= 3 && a <= 3)) r[h > a ? 0 : h === a ? 1 : 2] += poissonPmf(i, lh) * poissonPmf(j, la);
-  }
-  const res = shapeShares(r.map((v) => v), lo, 100);
-  return { exact, res };
+  const jig = (v, k) => (v > 0 ? v * (1 + (seededRand(`${m.id}:${k}:${bucket}`) - 0.5) * 2 * noise) : 0);
+  const norm = (arr, tag) => { const x = arr.map((v, i) => jig(v, tag + i)), t = x.reduce((a, b) => a + b, 0) || 1; return x.map((v) => v / t); };
+  return { exact: norm(exact, "e"), res: norm(res, "r") };
 }
-const sharesToPools = (shares, total) => shares.map((v) => +((v / 100) * total).toFixed(4));
-/* أسعار فعّالة للمباراة الحية: نسب المحرّك (إن فُعّل) وإلا نموذج المباريات الحقيقية */
-function epFor(m, pools, kind) {
-  if (liveEngineOn(m)) {
-    const sh = liveShares(m);
-    return sharesToPools(kind === "res" ? sh.res : sh.exact, Math.max(100, totalPool(pools)));
-  }
-  if (!(m.real && m.status === "live")) return pools;
-  const d = liveDist(m.score, m.minute);
-  return effPools(pools, kind === "res" ? d.res : d.exact, m.minute, true);
+const rateOf = (p, lo, hi) => +(lo + (hi - lo) * (1 - Math.min(1, Math.max(0, p)))).toFixed(2);
+/** نسب الربح (٪) لكل خيار: { exact: [17], res: [3] } */
+function ratesOf(m) {
+  const { lo, hi } = rateBounds(), pr = matchProbs(m), man = m.manualRates || {};
+  const pick = (mk, probs) => probs.map((p, i) => (Array.isArray(man[mk]) && Number.isFinite(Number(man[mk][i])) ? +clampN(man[mk][i], lo, hi, hi).toFixed(2) : rateOf(p, lo, hi)));
+  return { exact: pick("exact", pr.exact), res: pick("res", pr.res), probs: pr };
 }
+const oddsFromRate = (rate) => +(1 + rate / 100).toFixed(4);   // عامل الدفع الداخلي: 1 + النسبة/100 (لا يُعرض كمضاعف)
 const matchView = (m) => {
   const v = matchViewBase(m);
+  const rt = ratesOf(m);
   const live = m.status === "live";
-  if (!m.real && !liveEngineOn(m)) return live ? { ...v, dead: deadOf(m) } : v;
-  const exact = epFor(m, m.pools, "exact"), res = epFor(m, rPoolsOf(m), "res");
   return {
-    ...v, pools: exact, rPools: res,
-    odds: exact.map((_, i) => +oddsOf(exact, i, m.boosted, feeOf(m)).toFixed(3)), chances: exact.map((_, i) => +chanceOf(exact, i).toFixed(4)),
-    rOdds: res.map((_, i) => +oddsOf(res, i, m.boosted, feeOf(m)).toFixed(3)), rChances: res.map((_, i) => +chanceOf(res, i).toFixed(4)),
+    ...v, rates: rt.exact, rRates: rt.res,
+    chances: rt.probs.exact.map((x) => +x.toFixed(4)), rChances: rt.probs.res.map((x) => +x.toFixed(4)),
     dead: live ? deadOf(m) : null, suspendUntil: m.suspendUntil || 0,
+    manualRates: m.manualRates || null,
   };
 };
 const withOdds = (m, pools) => ({
@@ -829,16 +804,11 @@ async function cashoutQuote(u, b, cfg, ms) {
   if (!cfg.settings.cashoutEnabled || u.frozen || b.status !== "open") return null;
   const m = findMatch(ms, b.matchId);
   if (!m) return null;
-  const progress = m.status === "live" ? Math.min(0.9, m.minute / 90) : m.status === "ended" ? 1 : 0.1;
-  const seed = `${b._id}:${Math.floor(Date.now() / 4000)}`;
-  if (m.real && m.status === "live") {   // قيمة عادلة من النموذج الحي: الرهان المستحيل = لا كاش أوت
-    if (b.market !== "result" && deadExact(m.score)[b.optIndex]) return null;
-    const cur = oddsOf(epFor(m, poolsForBet(m, b), b.market === "result" ? "res" : "exact"), b.optIndex, m.boosted, feeOf(m));
-    const fair = Math.min(b.stake * b.odds * 0.98, (b.stake * b.odds / Math.max(cur, 1.01)) * 0.93);
-    return r2(Math.max(0, fair) * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
-  }
-  const raw = cashoutValue(b.stake, b.odds, oddsOf(poolsForBet(m, b), b.optIndex, m.boosted, feeOf(m)), progress, seed);
-  return r2(raw * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
+  const margin = 1 - (cfg.settings.cashoutMarginPct || 0) / 100;
+  if (m.status !== "live") return r2(b.stake * 0.97 * margin);   // قبل البداية: ما يقارب المبلغ
+  if (b.market !== "result" && deadOf(m)[b.optIndex]) return null;   // الرهان المستحيل = لا كاش أوت
+  const pr = matchProbs(m), p = (b.market === "result" ? pr.res : pr.exact)[b.optIndex] || 0;
+  return r2(Math.max(0, b.stake * b.odds * p * 0.98) * margin);   // قيمة عادلة = الدفع المحتمل × احتمال الفوز الآن
 }
 /** استرداد رهان مفتوح (إلغاء/حذف مباراة) */
 async function refundBet(b, label) {
@@ -926,7 +896,7 @@ route("GET", "/api/ticker", PUBLIC_R, ({ matches }) => ({
   at: Date.now(),
   matches: matches.map((m) => ({
     id: m.id, status: m.status, minute: m.minute, score: m.score,
-    odds: epFor(m, m.pools, "exact").map((_, i, ep) => +oddsOf(ep, i, m.boosted, feeOf(m)).toFixed(3)), totalPool: Math.round(totalPool(m.pools)),
+    rates: ratesOf(m).exact, totalPool: Math.round(totalPool(m.pools)),
   })),
 }));
 route("GET", "/api/matches/:id", PUBLIC_R, ({ params, matches }) => {
@@ -934,15 +904,11 @@ route("GET", "/api/matches/:id", PUBLIC_R, ({ params, matches }) => {
   if (!m) throw notFound("المباراة غير موجودة");
   return matchView(m);
 });
-route("GET", "/api/matches/:id/odds", PUBLIC_R, ({ params, query, matches }) => {
+route("GET", "/api/matches/:id/odds", PUBLIC_R, ({ params, matches }) => {
   const m = findMatch(matches, params.id);
   if (!m) throw notFound("المباراة غير موجودة");
-  const stake = Number(query.stake) || 0;
-  return m.pools.map((_, i) => ({
-    index: i, pick: SCORES[i], odds: +oddsOf(m.pools, i, m.boosted, feeOf(m)).toFixed(3),
-    oddsAfterStake: stake > 0 ? +oddsAfter(m.pools, i, stake, m.boosted, feeOf(m)).toFixed(3) : undefined,
-    chance: +chanceOf(m.pools, i).toFixed(4),
-  }));
+  const rt = ratesOf(m);   // النسبة = صافي الربح ٪؛ الدفع = المبلغ × (1 + النسبة/100)
+  return rt.exact.map((rate, i) => ({ index: i, pick: SCORES[i], rate, payoutFactor: oddsFromRate(rate) }));
 });
 route("GET", "/api/stream", { auth: false, sync: false }, () => {
   throw new HttpError(410, "البث الحي (SSE) غير مدعوم على Vercel — استعلم من /api/ticker كل ثانيتين تقريباً");
@@ -1129,11 +1095,11 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       boosted = m.boosted;
       if (market === "result") {
         const rp = rPoolsOf(m).slice();
-        odds = oddsAfter(epFor(m, rp, "res"), optIndex, stake, m.boosted, feeOf(m));
+        odds = oddsFromRate(ratesOf(m).res[optIndex]);   // الربح = النسبة المعروضة لحظة الرهان (تُقفل مع الرهان)
         rp[optIndex] += stake;
         return ms.map((x) => (x.id === m.id ? { ...x, rPools: rp } : x));
       }
-      odds = oddsAfter(epFor(m, m.pools, "exact"), optIndex, stake, m.boosted, feeOf(m));
+      odds = oddsFromRate(ratesOf(m).exact[optIndex]);
       const pools = m.pools.slice(); pools[optIndex] += stake;
       return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-59), +odds.toFixed(3)] : h)) } : x));
     });
@@ -1965,7 +1931,14 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
       const np = ch.map((v) => Math.max(1, +((v / sum) * total).toFixed(2)));
       return ms.map((x) => (x.id === m.id ? (out = result ? { ...x, rPools: np, manualPrices: true } : { ...withOdds(x, np), manualPrices: true }) : x));
     }
-    if (body?.auto) return ms.map((x) => (x.id === m.id ? (out = { ...x, manualPrices: false }) : x));   // عودة للتسعير التلقائي
+    /* ضبط نسب الربح ٪ مباشرةً لسوق: market = exact (17) أو result (3) — كل قيمة بين الحد الأدنى والأعلى */
+    if (Array.isArray(body?.rates)) {
+      const result = body.market === "result", n = result ? 3 : OPT_COUNT, { lo, hi } = rateBounds();
+      if (body.rates.length !== n || body.rates.some((v) => !Number.isFinite(Number(v)))) throw bad("نسب غير صالحة");
+      const rates = body.rates.map((v) => +clampN(v, lo, hi, hi).toFixed(2));
+      return ms.map((x) => (x.id === m.id ? (out = { ...x, manualRates: { ...(x.manualRates || {}), [result ? "res" : "exact"]: rates } }) : x));
+    }
+    if (body?.auto) return ms.map((x) => (x.id === m.id ? (out = { ...x, manualRates: null, manualPrices: false }) : x));   // عودة للتسعير التلقائي
     let pools = m.pools.slice();
     if (body?.reset) pools = seedPools(1.05);
     else if (body?.scale !== undefined) { const f = Math.min(10, Math.max(0.1, Number(body.scale) || 1)); pools = pools.map((p) => Math.max(1, +(p * f).toFixed(2))); }
@@ -1974,7 +1947,7 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
       if (!Number.isInteger(i) || i < 0 || i >= OPT_COUNT) throw bad("خيار غير صالح");
       pools[i] = body.value !== undefined ? Math.max(1, Number(body.value) || 1) : Math.max(1, pools[i] + (Number(body.delta) || 0));
     }
-    return ms.map((x) => (x.id === m.id ? (out = { ...withOdds(x, pools), manualPrices: body?.reset ? false : true }) : x));
+    return ms.map((x) => (x.id === m.id ? (out = withOdds(x, pools)) : x));
   });
   await adminLog(`تعديل مجمّعات المباراة ${params.id}`);
   return matchView(out);
@@ -1982,7 +1955,7 @@ route("PUT", "/api/admin/matches/:id/pools", A, async ({ params, body }) => {
 /* إعادة كل المباريات الحية للتسعير التلقائي (النسب تتبع سير المباراة من جديد) */
 route("POST", "/api/admin/matches/auto-prices", A, async () => {
   let n = 0;
-  await mutateState((ms) => ms.map((x) => { if (x.manualPrices) { n++; return { ...x, manualPrices: false }; } return x; }));
+  await mutateState((ms) => ms.map((x) => { if (x.manualRates || x.manualPrices) { n++; return { ...x, manualRates: null, manualPrices: false }; } return x; }));
   await adminLog(`إعادة ${n} مباراة للتسعير التلقائي`);
   return { ok: true, count: n };
 });
