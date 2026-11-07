@@ -455,7 +455,7 @@ function vipOf(xp, cfg) {
 const publicUser = (u, cfg) => ({
   id: u._id, name: u.name, avatar: u.avatar, joinedAt: u.joinedAt,
   balance: r2(u.balance), vipXp: u.vipXp, vip: vipOf(u.vipXp, cfg),
-  streak: u.streak, bestStreak: u.bestStreak, frozen: u.frozen,
+  streak: u.streak, bestStreak: u.bestStreak, frozen: u.frozen, banned: !!u.banned,
   inviteCode: inviteCodeOf(u._id), lastBonusAt: u.lastBonusAt, lastSeenAt: u.lastSeenAt || 0,
 });
 async function addTx(userId, tx) {
@@ -504,6 +504,7 @@ async function authUser(req) {
     await users.updateOne({ _id: id }, { $set: { name } });
     u.name = name;
   }
+  if (u.banned) throw forbid("تم حظر حسابك من التطبيق");
   return u;
 }
 function assertActive(u, cfg) {
@@ -957,7 +958,11 @@ route("POST", "/api/telegram/webhook", { auth: false, sync: false }, async ({ re
     const msg = body?.message;
     const text = typeof msg?.text === "string" ? msg.text.trim() : "";
     // /start و/start@BotName و/start ref_xxx كلها تُظهر الترحيب
-    if (msg?.chat?.type === "private" && /^\/start(@\w+)?(\s|$)/i.test(text)) await sendWelcome(msg.chat.id);
+    if (msg?.chat?.type === "private" && /^\/start(@\w+)?(\s|$)/i.test(text)) {
+      const ref = text.match(/^\/start(?:@\w+)?\s+ref_(\S+)/i);
+      if (ref && msg.from?.id) await savePendingRef(msg.from.id, ref[1]).catch((e) => console.error("savePendingRef:", e?.message || e));
+      await sendWelcome(msg.chat.id);
+    }
   } catch (e) {
     console.error("telegram webhook:", e?.message || e);   // لا نُرجع خطأ حتى لا يعيد تيليجرام الإرسال بلا نهاية
   }
@@ -985,9 +990,26 @@ async function attachReferral(user, code) {
     await addNotice(inviter._id, { title: "👥 صديق جديد انضم", body: `${user.name} انضم عبر رابط دعوتك.`, tone: "info" });
   } catch { /* مُحال مسبقاً */ }
 }
+/* إحالة معلّقة: تُحفظ عند ضغط الصديق Start في البوت (/start ref_CODE) وتُربط بحسابه عند أول دخول للتطبيق.
+ * بهذا لا تعتمد الإحالة على طريقة فتح التطبيق (start_param) ولا على الاسم المختصر للتطبيق في BotFather. */
+const PENDING_REF_TTL = 30 * 24 * 3600_000;
+async function savePendingRef(tgId, code) {
+  if (!tgId || !code) return;
+  const { meta } = await C();
+  await meta.updateOne({ _id: `pref:${tgId}` }, { $set: { code: String(code).slice(0, 40), at: Date.now() } }, { upsert: true });
+}
+async function claimPendingRef(user) {
+  if (!user?._id || user.referredBy) return;
+  const { meta } = await C();
+  const doc = await meta.findOne({ _id: `pref:${user._id}` });
+  if (!doc) return;
+  if (Date.now() - (doc.at || 0) <= PENDING_REF_TTL) await attachReferral(user, doc.code);
+  await meta.deleteOne({ _id: doc._id });
+}
 route("POST", "/api/auth/telegram", async ({ user, body, cfg, req }) => {
   // الإحالة تُحتسب فقط عند دخول المدعو إلى التطبيق عبر تيليجرام (حساب حقيقي بتوقيع موثّق)، لا كضيف
   if (body?.ref && user._id && req.headers["x-telegram-init-data"]) await attachReferral(user, String(body.ref).replace(/^ref_/, ""));
+  if (user._id && req.headers["x-telegram-init-data"]) await claimPendingRef((await (await C()).users.findOne({ _id: user._id })) || user).catch((e) => console.error("claimPendingRef:", e?.message || e));
   const { users } = await C();
   return { user: publicUser(await users.findOne({ _id: user._id }), cfg) };
 });
@@ -1286,11 +1308,11 @@ route("GET", "/api/referrals", async ({ user }) => {
   const earned = r2(list.reduce((a, r) => a + r.commissionEarned, 0));
   const code = inviteCodeOf(user._id);
   return {
-    code, link: `https://t.me/${BOT_USERNAME}/app?startapp=ref_${code}`, referrals: list,
+    code, link: `https://t.me/${BOT_USERNAME}?start=ref_${code}`, referrals: list,
     totalEarned: earned, claimed: r2(user.claimedCommission || 0), pending: r2(Math.max(0, earned - (user.claimedCommission || 0))),
   };
 });
-route("GET", "/api/referrals/link", ({ user }) => ({ link: `https://t.me/${BOT_USERNAME}/app?startapp=ref_${inviteCodeOf(user._id)}` }));
+route("GET", "/api/referrals/link", ({ user }) => ({ link: `https://t.me/${BOT_USERNAME}?start=ref_${inviteCodeOf(user._id)}` }));
 route("POST", "/api/referrals/claim", async ({ user, cfg }) => {
   assertActive(user, cfg);
   if (!cfg.settings.commissionEnabled) throw forbid("العمولة متوقفة");
@@ -1409,6 +1431,7 @@ route("GET", "/api/admin/users/:id", A, async ({ params }) => {
 route("PATCH", "/api/admin/users/:id", A, async ({ params, body, cfg }) => {
   const set = {};
   for (const k of ["name", "avatar", "frozen", "vipXp", "streak", "bestStreak", "lastBonusAt", "claimedCommission"]) if (body[k] !== undefined) set[k] = body[k];
+  if (body.banned !== undefined) { set.banned = !!body.banned; set.bannedAt = body.banned ? Date.now() : null; }   // حظر/رفع حظر اللاعب من التطبيق
   if (body.balance !== undefined) { const v = Number(body.balance); if (!Number.isFinite(v) || v < 0) throw bad("رصيد غير صحيح"); set.balance = r2(v); }
   for (const k of ["dailyLossLimit", "maxStake", "selfExcludedUntil"]) if (body.limits && body.limits[k] !== undefined) set[`limits.${k}`] = body.limits[k];
   for (const k of ["enabled", "threshold", "amount", "method", "dailyCap", "depositedToday"]) if (body.autoDeposit && body.autoDeposit[k] !== undefined) set[`autoDeposit.${k}`] = body.autoDeposit[k];
@@ -1417,6 +1440,26 @@ route("PATCH", "/api/admin/users/:id", A, async ({ params, body, cfg }) => {
   if (!u) throw notFound("المستخدم غير موجود");
   await adminLog(`تعديل المستخدم ${u._id}: ${Object.keys(set).join("، ")}`);
   return publicUser(u, cfg);
+});
+/* حذف اللاعب نهائياً: حسابه ورهاناته وحركاته وإحالاته. الرهانات المفتوحة تُسحب من المجمّعات أولاً.
+ * ملاحظة: لو فتح التطبيق مجدداً يُنشأ له حساب جديد فارغ — لمنع عودته استعمل «الحظر» بدل الحذف. */
+route("DELETE", "/api/admin/users/:id", A, async ({ params }) => {
+  const id = Number(params.id);
+  if (!Number.isInteger(id)) throw bad("معرّف غير صحيح");
+  if (id === 0) throw bad("لا يمكن حذف حساب الضيف المشترك");
+  const { users, bets, txs, refs, deposits, meta } = await C();
+  const u = await users.findOne({ _id: id });
+  if (!u) throw notFound("اللاعب غير موجود");
+  for (const b of await bets.find({ userId: id, status: "open" }).toArray()) await refundBet(b, "حذف حساب").catch(() => undefined);
+  await bets.deleteMany({ userId: id });
+  await txs.deleteMany({ userId: id });
+  await deposits.updateMany({ userId: id, status: "pending" }, { $set: { status: "expired" } });   // لا يُقبل تحويل لحساب محذوف
+  await refs.deleteMany({ $or: [{ userId: id }, { inviterId: id }] });
+  await users.updateMany({ referredBy: id }, { $set: { referredBy: null } });
+  await meta.deleteOne({ _id: `pref:${id}` });
+  await users.deleteOne({ _id: id });
+  await adminLog(`حذف اللاعب نهائياً: ${id} (${u.name})`);
+  return { ok: true };
 });
 route("POST", "/api/admin/users/:id/balance", A, async ({ params, body }) => {
   const delta = Number(body.delta);
