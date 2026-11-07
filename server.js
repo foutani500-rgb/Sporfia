@@ -38,6 +38,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { parseFixture, liveDist, deadExact, effPools } from "./real-football.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /* ====================== محرك المجمّع (منسوخ من src/pool.js) ====================== */
@@ -215,7 +216,7 @@ const crestStyle = (team) => ({
 function tickMatches(matches) {
     const goals = [];
     const next = matches.map((m) => {
-        if (m.status === "ended")
+        if (m.real || m.status === "ended")
             return m;
         // مباراة لم تبدأ ووصل موعدها → مباشرة
         if (m.status === "upcoming" && Date.now() >= m.startsAt) {
@@ -255,7 +256,7 @@ function tickMatches(matches) {
 /** تحديث خفيف للأسعار للمباريات غير المباشرة (تدفّق أموال) */
 function driftUpcoming(matches) {
     return matches.map((m) => {
-        if (m.status !== "upcoming" || Math.random() < 0.7)
+        if (m.real || m.status !== "upcoming" || Math.random() < 0.7)
             return m;
         const i = Math.floor(Math.random() * OPT_COUNT);
         const pools = m.pools.slice();
@@ -312,7 +313,12 @@ const DEFAULT_SETTINGS = {
   maintenance: false, maintenanceMsg: "التطبيق في صيانة قصيرة، نعود قريباً ⚙️",
   bettingEnabled: true, depositsEnabled: true, withdrawalsEnabled: true,
   simPaused: false, simSpeedMs: Number(process.env.SIM_SPEED_MS) || 1600,
-  liveBetting: false, cashoutEnabled: true, cancelEnabled: true,
+  liveBetting: true, cashoutEnabled: true, cancelEnabled: true,
+  liveCutoffMin: 85,        // آخر دقيقة يُسمح فيها بالرهان الحي (90 = حتى النهاية)
+  goalPauseSec: 30,         // إيقاف الرهان لحظات بعد كل هدف (حماية من تأخر البيانات)
+  realMatchesEnabled: true, // جلب المباريات الحقيقية من API-Sports
+  realSyncSec: 60,          // كل كم ثانية نحدّث المباريات النشطة (يستهلك من حصة API)
+  showSimMatches: true,     // إظهار مباريات الساحة التجريبية بجانب الحقيقية
   minStake: 1, maxStake: 0, cashoutMarginPct: 0,
   platformFeePct: 0, // نسبة ربح المنصة المخصومة من مجمّع كل مباراة (0..50) — الافتراضي 0%، وتُعدَّل من لوحة الأدمن
   dailyBonusEnabled: true, commissionEnabled: true, autoDepositEnabled: true,
@@ -397,6 +403,10 @@ async function getConfig(force = false) {
   if (!doc) {
     doc = { _id: "config", settings: clone(DEFAULT_SETTINGS), leagues: clone(DEFAULT_LEAGUES), vipTiers: clone(DEFAULT_VIP_TIERS), payments: clone(DEFAULT_PAYMENTS) };
     try { await meta.insertOne(doc); } catch { doc = await meta.findOne({ _id: "config" }); }
+  }
+  if (!doc.settings?.liveMigrated) {   // ترحيل لمرة واحدة: تفعيل الرهان الحي افتراضياً
+    await meta.updateOne({ _id: "config" }, { $set: { "settings.liveBetting": true, "settings.liveMigrated": true } });
+    doc.settings = { ...(doc.settings || {}), liveBetting: true, liveMigrated: true };
   }
   doc.settings = { ...DEFAULT_SETTINGS, ...(doc.settings || {}), announcement: { ...DEFAULT_SETTINGS.announcement, ...(doc.settings?.announcement || {}) } };
   FEE_NOW = clampFeePct(doc.settings.platformFeePct, FEE * 100) / 100;
@@ -512,7 +522,7 @@ async function mutateState(fn) {
 }
 function replenish(ms, now) {
   const keep = ms.filter((m) => !(m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS));
-  const removed = ms.length - keep.length;
+  const removed = ms.filter((m) => !m.real && m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS).length;
   for (let i = 0; i < removed; i++) {
     const seed = FIXTURES[Math.floor(Math.random() * FIXTURES.length)];
     const nm = buildMatch({ ...seed, inMinutes: 20 + Math.floor(Math.random() * 900) }, 0);
@@ -521,9 +531,72 @@ function replenish(ms, now) {
   }
   return keep;
 }
+/* ===== المباريات الحقيقية من API-Sports: تُدمج في نفس قائمة الساحة وتُسوّى رهاناتها بنتيجة الـ90 دقيقة ===== */
+function newRealMatch(p) {
+  const pools = seedPools(1.0);
+  const odds = pools.map((_, i) => oddsOf(pools, i, false));
+  return { ...p, pools, boosted: false, hot: false, oddsHistory: odds.map((o) => [+o.toFixed(3), +o.toFixed(3)]) };
+}
+async function syncReal(cfg, force = false) {
+  const s = cfg.settings;
+  if (s.realMatchesEnabled === false || !fbKey() || (s.simPaused && !force)) return { skipped: true };
+  const { state } = await C();
+  const now = Date.now();
+  const gap = force ? 0 : Math.max(15, Number(s.realSyncSec) || 60) * 1000;
+  const claim = await state.updateOne({ _id: "matches", $or: [{ realAt: { $lt: now - gap } }, { realAt: { $exists: false } }] }, { $set: { realAt: now } });
+  if (claim.modifiedCount !== 1) return { skipped: true };
+  const st = await loadState();
+  const items = [];
+  const grab = async (qs) => {
+    if (!fbTakeUpstreamToken()) return;
+    const { status, json } = await fbUpstream("fixtures", qs);
+    if (status === 200 && !fbHasErrors(json) && Array.isArray(json.response)) items.push(...json.response);
+  };
+  if (force || !st.realDailyAt || now - st.realDailyAt > 15 * 60_000) {      // اكتشاف مباريات اليوم والغد
+    const d0 = new Date(now).toISOString().slice(0, 10), d1 = new Date(now + 86_400_000).toISOString().slice(0, 10);
+    await grab("date=" + d0 + "&timezone=UTC"); await grab("date=" + d1 + "&timezone=UTC");
+    await state.updateOne({ _id: "matches" }, { $set: { realDailyAt: now } });
+  }
+  const active = st.matches.filter((m) => m.real && m.status !== "ended" && m.startsAt <= now + 10 * 60_000).slice(0, 20).map((m) => m.fid);
+  if (active.length) await grab("ids=" + active.join("-") + "&timezone=UTC");    // تحديث النشطة (دقيقة/نتيجة/نهاية)
+  const parsed = items.map(parseFixture).filter((p) => p && FB_LEAGUE_SET.has(String(p.leagueApiId)));
+  if (!parsed.length) return { fetched: 0 };
+  const ended = new Set(), voided = new Set();
+  const ms = await mutateState((arr) => {
+    ended.clear(); voided.clear();
+    const out = arr.slice(), idx = new Map(arr.map((m, i) => [m.id, i]));
+    for (const p of parsed) {
+      const i = idx.get(p.id);
+      if (i === undefined) {
+        if (p.status === "ended" || p.status === "void") continue;
+        out.push(newRealMatch(p)); idx.set(p.id, out.length - 1); continue;
+      }
+      const m = out[i];
+      if (!m.real || m.status === "ended") continue;
+      if (p.status === "void") { voided.add(m.id); continue; }
+      const next = { ...m, apiStatus: p.apiStatus, status: p.status, minute: p.minute, startsAt: p.startsAt, round: p.round,
+        home: { ...m.home, logo: p.home.logo }, away: { ...m.away, logo: p.away.logo } };
+      if (p.status === "live" || p.status === "ended") {
+        if (p.status === "live" && p.score[0] + p.score[1] > m.score[0] + m.score[1])
+          next.suspendUntil = Date.now() + Math.max(0, Number(s.goalPauseSec ?? 30)) * 1000;
+        next.score = p.score;
+      }
+      if (p.status === "ended") { next.endedAt = Date.now(); next.minute = 90; ended.add(m.id); }
+      out[i] = next;
+    }
+    return out.filter((m) => !voided.has(m.id));
+  });
+  if (ended.size) await settleBets(ended, ms).catch((e) => console.error("settle real:", e));
+  if (voided.size) {
+    const { bets } = await C();
+    for (const id of voided) for (const b of await bets.find({ status: "open", matchId: id }).toArray()) await refundBet(b, "إلغاء المباراة").catch(() => undefined);
+  }
+  return { fetched: parsed.length, ended: ended.size, voided: voided.size };
+}
 /** يلحق المباريات بالوقت الحقيقي ويسوّي الرهانات للمباريات المنتهية */
 async function syncMatches() {
   const cfg = await getConfig();
+  await syncReal(cfg).catch((e) => console.error("syncReal:", e?.message || e));
   const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
   const { state } = await C();
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -573,7 +646,7 @@ const rPoolsOf = (m) => {
 const resultIdx = (score) => (score[0] > score[1] ? 0 : score[0] === score[1] ? 1 : 2);
 const poolsForBet = (m, b) => (b.market === "result" ? rPoolsOf(m) : m.pools);
 const pickText = (b, m) => (b.market === "result" ? [`فوز ${m.home.name}`, "تعادل", `فوز ${m.away.name}`][RES_PICKS.indexOf(b.pick)] || b.pick : b.pick);
-const matchView = (m) => ({
+const matchViewBase = (m) => ({
   ...m,
   rPools: rPoolsOf(m),
   rOdds: rPoolsOf(m).map((_, i) => +oddsOf(rPoolsOf(m), i, m.boosted, feeOf(m)).toFixed(3)),
@@ -585,6 +658,24 @@ const matchView = (m) => ({
   effFeePct: +(feeOf(m) * 100).toFixed(2), // النسبة المطبّقة فعلياً على هذه المباراة (الخاصة أو العامة)
   progress: +matchProgress(m).toFixed(3),
 });
+/* أسعار فعّالة للمباراة الحقيقية الحية: مزج أموال اللاعبين بنموذج احتمالات يعتمد النتيجة والدقيقة */
+function epFor(m, pools, kind) {
+  if (!(m.real && m.status === "live")) return pools;
+  const d = liveDist(m.score, m.minute);
+  return effPools(pools, kind === "res" ? d.res : d.exact, m.minute, true);
+}
+const matchView = (m) => {
+  const v = matchViewBase(m);
+  if (!m.real) return v;
+  const live = m.status === "live";
+  const exact = epFor(m, m.pools, "exact"), res = epFor(m, rPoolsOf(m), "res");
+  return {
+    ...v, pools: exact, rPools: res,
+    odds: exact.map((_, i) => +oddsOf(exact, i, m.boosted, feeOf(m)).toFixed(3)), chances: exact.map((_, i) => +chanceOf(exact, i).toFixed(4)),
+    rOdds: res.map((_, i) => +oddsOf(res, i, m.boosted, feeOf(m)).toFixed(3)), rChances: res.map((_, i) => +chanceOf(res, i).toFixed(4)),
+    dead: live ? deadExact(m.score) : null, suspendUntil: m.suspendUntil || 0,
+  };
+};
 const withOdds = (m, pools) => ({
   ...m, pools,
   oddsHistory: m.oddsHistory.map((h, i) => [...h.slice(-59), +oddsOf(pools, i, m.boosted, feeOf(m)).toFixed(3)]),
@@ -663,6 +754,12 @@ async function cashoutQuote(u, b, cfg, ms) {
   if (!m) return null;
   const progress = m.status === "live" ? Math.min(0.9, m.minute / 90) : m.status === "ended" ? 1 : 0.1;
   const seed = `${b._id}:${Math.floor(Date.now() / 4000)}`;
+  if (m.real && m.status === "live") {   // قيمة عادلة من النموذج الحي: الرهان المستحيل = لا كاش أوت
+    if (b.market !== "result" && deadExact(m.score)[b.optIndex]) return null;
+    const cur = oddsOf(epFor(m, poolsForBet(m, b), b.market === "result" ? "res" : "exact"), b.optIndex, m.boosted, feeOf(m));
+    const fair = Math.min(b.stake * b.odds * 0.98, (b.stake * b.odds / Math.max(cur, 1.01)) * 0.93);
+    return r2(Math.max(0, fair) * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
+  }
   const raw = cashoutValue(b.stake, b.odds, oddsOf(poolsForBet(m, b), b.optIndex, m.boosted, feeOf(m)), progress, seed);
   return r2(raw * (1 - (cfg.settings.cashoutMarginPct || 0) / 100));
 }
@@ -725,7 +822,7 @@ route("GET", "/api/config", { auth: false, sync: false }, async ({ cfg }) => {
   return {
     maintenance: s.maintenance, maintenanceMsg: s.maintenanceMsg, announcement: s.announcement,
     bettingEnabled: s.bettingEnabled, depositsEnabled: s.depositsEnabled, withdrawalsEnabled: s.withdrawalsEnabled,
-    liveBetting: s.liveBetting, cashoutEnabled: s.cashoutEnabled, cancelEnabled: s.cancelEnabled,
+    liveBetting: s.liveBetting, liveCutoffMin: s.liveCutoffMin, goalPauseSec: s.goalPauseSec, cashoutEnabled: s.cashoutEnabled, cancelEnabled: s.cancelEnabled,
     platformFeePct: s.platformFeePct, minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw, minDeposit: s.minDeposit, maxDeposit: s.maxDeposit,
     dailyBonusEnabled: s.dailyBonusEnabled, commissionEnabled: s.commissionEnabled, autoDepositEnabled: s.autoDepositEnabled,
     bonusBase: s.bonusBase, bonusPerStreak: s.bonusPerStreak, bonusCooldownHours: s.bonusCooldownHours,
@@ -740,8 +837,8 @@ route("GET", "/api/payments", PUBLIC_R, ({ cfg }) => cfg.payments.filter((p) => 
 route("GET", "/api/vip/tiers", PUBLIC_R, ({ cfg }) => cfg.vipTiers);
 
 /* ---- المباريات ---- */
-route("GET", "/api/matches", PUBLIC_R, ({ query, matches }) => {
-  let list = matches;
+route("GET", "/api/matches", PUBLIC_R, ({ query, matches, cfg }) => {
+  let list = cfg.settings.showSimMatches === false ? matches.filter((m) => m.real) : matches;
   if (query.league) list = list.filter((m) => m.leagueId === query.league);
   if (query.status) list = list.filter((m) => m.status === query.status);
   if (query.hot === "1") list = list.filter((m) => m.hot);
@@ -922,7 +1019,11 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
     if (!s.bettingEnabled) throw forbid("الرهان متوقف حالياً");
     if (m.suspended) throw bad("الرهان على هذه المباراة موقوف مؤقتاً");
     if (m.status === "ended") throw bad("المباراة انتهت");
-    if (m.status === "live" && !s.liveBetting) throw bad("الرهان على النتيجة الدقيقة متاح قبل الانطلاق فقط");
+    if (m.status === "live" && !s.liveBetting) throw bad("الرهان أثناء المباراة متوقف حالياً");
+    if (m.status === "live" && m.real) {
+      if (m.minute >= (Number(s.liveCutoffMin) || 90)) throw bad("أُغلق الرهان قرب نهاية المباراة");
+      if (m.suspendUntil && Date.now() < m.suspendUntil) throw bad("تم تسجيل هدف — الرهان متوقف لحظات");
+    }
   };
   checkMatch(m0);
   if (!(stake > 0)) throw bad("أدخل مبلغاً صحيحاً");
@@ -946,15 +1047,16 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       const m = findMatch(ms, m0.id);
       if (!m) throw bad("المباراة غير متوفرة");
       checkMatch(m);
+      if (market === "exact" && m.real && m.status === "live" && deadExact(m.score)[optIndex]) throw bad("هذه النتيجة لم تعد ممكنة");
       matchLabel = `${m.home.name} × ${m.away.name}`;
       boosted = m.boosted;
       if (market === "result") {
         const rp = rPoolsOf(m).slice();
-        odds = oddsAfter(rp, optIndex, stake, m.boosted, feeOf(m));
+        odds = oddsAfter(epFor(m, rp, "res"), optIndex, stake, m.boosted, feeOf(m));
         rp[optIndex] += stake;
         return ms.map((x) => (x.id === m.id ? { ...x, rPools: rp } : x));
       }
-      odds = oddsAfter(m.pools, optIndex, stake, m.boosted, feeOf(m));
+      odds = oddsAfter(epFor(m, m.pools, "exact"), optIndex, stake, m.boosted, feeOf(m));
       const pools = m.pools.slice(); pools[optIndex] += stake;
       return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-59), +odds.toFixed(3)] : h)) } : x));
     });
@@ -1805,11 +1907,17 @@ route("POST", "/api/admin/matches/end-live", A, async () => {
   const ended = new Set();
   const ms = await mutateState((arr) => {
     ended.clear();
-    return arr.map((m) => (m.status === "live" ? (ended.add(m.id), { ...m, status: "ended", minute: 90, endedAt: Date.now() }) : m));
+    return arr.map((m) => (m.status === "live" && !m.real ? (ended.add(m.id), { ...m, status: "ended", minute: 90, endedAt: Date.now() }) : m));
   });
   const ev = ended.size ? await settleBets(ended, ms) : [];
   await adminLog(`إنهاء ${ended.size} مباراة مباشرة وتسوية`);
   return { ok: true, ended: ended.size, settled: ev.length };
+});
+route("POST", "/api/admin/real/sync", A, async ({ cfg }) => {
+  const r = await syncReal(cfg, true);
+  const st = await loadState();
+  await adminLog("تحديث المباريات الحقيقية يدوياً");
+  return { ok: true, ...r, real: st.matches.filter((m) => m.real).length, live: st.matches.filter((m) => m.real && m.status === "live").length, hasKey: !!fbKey() };
 });
 route("POST", "/api/admin/sim/advance", A, async ({ body }) => {
   const n = Math.min(500, Math.max(1, Math.floor(Number(body?.ticks) || 1)));
