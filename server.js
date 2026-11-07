@@ -914,6 +914,56 @@ route("GET", "/api/stream", { auth: false, sync: false }, () => {
   throw new HttpError(410, "البث الحي (SSE) غير مدعوم على Vercel — استعلم من /api/ticker كل ثانيتين تقريباً");
 });
 
+/* ============================ بوت تيليجرام — رسالة الترحيب /start ============================
+ * مسار مستقل تماماً (POST /api/telegram/webhook) لا يمسّ أي مسار آخر ولا يحتاج مزامنة المباريات.
+ * التفعيل (مرة واحدة) — افتح هذا الرابط في المتصفح بعد النشر:
+ *   https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<نطاقك>/api/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>
+ * متغيّرات اختيارية: TELEGRAM_WEBHOOK_SECRET (يُنصح به — يمنع أي طرف غير تيليجرام من استدعاء المسار)
+ * ملاحظة: أزرار web_app لا تعمل إلا في المحادثة الخاصة، لذا نردّ على /start في الخاص فقط.
+ */
+async function tgCall(method, payload) {
+  if (!BOT_TOKEN) throw new Error("BOT_TOKEN غير مضبوط");
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(8000),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) throw new Error(`Telegram ${method}: ${j.description || r.status}`);
+  return j.result;
+}
+async function sendWelcome(chatId) {
+  // رسالة الترحيب الخاصة بمنصة sporfa للاستثمار الرياضي الذكي
+  const welcomeText = `*✅ مرحباً بك في منصتنا الرائدة sporfa للاستثمار الرياضي الذكي! 📈\n​نحن نمثل الجيل القادم من المنصات الرقمية التي تدمج بين شغف كرة القدم وفرص النمو المالي الحقيقي. نهدف إلى تمكين مستخدمينا من بناء عوائد مستدامة عبر نظام استثماري مدروس يعتمد على استراتيجيات رياضية وخطط يومية مرنة 👋*`;
+
+  await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: welcomeText,
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'اضغط هنا لتبدأ الربح 📈', web_app: { url: 'https://exquisite-sorbet-b586b5.netlify.app/' } }], // زر فتح التطبيق بالرابط المباشر والنص الجديد
+        [{ text: '💎 اشترك في قناتنا', url: 'https://t.me/aporfachannel' }],                  // رابط القناة
+        [{ text: '👥 انضم لمجموعتنا', url: 'https://t.me/sporfaa' }],         // رابط المجموعة
+      ],
+    },
+  });
+}
+route("POST", "/api/telegram/webhook", { auth: false, sync: false }, async ({ req, body }) => {
+  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (secret && req.headers["x-telegram-bot-api-secret-token"] !== secret) throw new HttpError(401, "غير مصرّح");
+  try {
+    const msg = body?.message;
+    const text = typeof msg?.text === "string" ? msg.text.trim() : "";
+    // /start و/start@BotName و/start ref_xxx كلها تُظهر الترحيب
+    if (msg?.chat?.type === "private" && /^\/start(@\w+)?(\s|$)/i.test(text)) await sendWelcome(msg.chat.id);
+  } catch (e) {
+    console.error("telegram webhook:", e?.message || e);   // لا نُرجع خطأ حتى لا يعيد تيليجرام الإرسال بلا نهاية
+  }
+  return { ok: true };
+});
+
 /* ---- الحساب ---- */
 async function attachReferral(user, code) {
   if (user.referredBy || !code) return;
