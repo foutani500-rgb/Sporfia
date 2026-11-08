@@ -907,10 +907,14 @@ route("GET", "/api/matches", PUBLIC_R, ({ query, matches, cfg }) => {
 /* خفيف للاستعلام الدوري (بديل البث الحي): دقائق + نتائج + أسعار */
 route("GET", "/api/ticker", PUBLIC_R, ({ matches }) => ({
   at: Date.now(),
-  matches: matches.map((m) => ({
-    id: m.id, status: m.status, minute: m.minute, score: m.score,
-    rates: ratesOf(m).exact, totalPool: Math.round(totalPool(m.pools)),
-  })),
+  matches: matches.map((m) => {
+    const rt = ratesOf(m);
+    return {
+      id: m.id, status: m.status, minute: m.minute, score: m.score,
+      rates: rt.exact, rRates: rt.res,   // rRates = نسب فوز الفريقين/التعادل (كانت مفقودة فلا تتحدّث في الواجهة)
+      manualRates: m.manualRates || null, totalPool: Math.round(totalPool(m.pools)),
+    };
+  }),
 }));
 route("GET", "/api/matches/:id", PUBLIC_R, ({ params, matches }) => {
   const m = findMatch(matches, params.id);
