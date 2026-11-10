@@ -30,6 +30,8 @@
  *      FOOTBALL_LEAGUES            الدوريات المسموحة (الافتراضي: كل دوريات وكؤوس العالم — ضع أرقاماً مفصولة بفواصل لحصرها)
  *      FOOTBALL_DAYS_AHEAD         عدد الأيام القادمة المجلوبة (الافتراضي 7)
  *      FOOTBALL_MAX_PER_DAY        أقصى عدد مباريات حقيقية لكل يوم (الافتراضي 100)
+ *      FOOTBALL_DAILY_BUDGET       حصة طلبات API-Sports في اليوم (الافتراضي 166)، يتوقف الجلب عند بلوغها ويستأنف في اليوم التالي (UTC)
+ *      FOOTBALL_DAILY_REFRESH_MIN  كل كم دقيقة يُحدَّث اليوم والغد (الافتراضي 60) · FOOTBALL_FUTURE_REFRESH_HOURS بقية الأسبوع (6) · FOOTBALL_LIVE_REFRESH_SEC الحية والنتائج (5400 = 90 دقيقة)
  *      FOOTBALL_MIN_PER_DAY        أدنى عدد مباريات لكل يوم (الافتراضي 6) — يُكمَّل بمباريات تجريبية إن نقصت
  *      FOOTBALL_ALLOWED_ORIGINS    اختياري: أصول مسموحة مفصولة بفواصل، مثل https://my-app.netlify.app
  *      FOOTBALL_UPSTREAM_PER_MIN   حد الطلبات الصادرة لـ API-Sports في الدقيقة (الافتراضي 10 = حد الخطة المجانية)
@@ -576,25 +578,28 @@ async function syncReal(cfg, force = false) {
   if (claim.modifiedCount !== 1) return { skipped: true };
   const st = await loadState();
   const items = [];
-  const grab = async (qs) => {
-    if (!fbTakeUpstreamToken()) return false;
+  const grab = async (qs, share = 1) => {
+    if (!fbTakeUpstreamToken() || !(await fbTakeDaily(share))) return false;
     const { status, json } = await fbUpstream("fixtures", qs);
     if (status === 200 && !fbHasErrors(json) && Array.isArray(json.response)) { items.push(...json.response); return true; }
     return false;
   };
   const dayStr = (k) => utcDay(now + k * 86_400_000);
-  if (force || !st.realDailyAt || now - st.realDailyAt > 15 * 60_000) {      // اليوم والغد: كل 15 دقيقة
+  if (force || !st.realDailyAt || now - st.realDailyAt > FB_DAILY_REFRESH_MS) {      // اليوم والغد: كل ساعة (افتراضياً)
     let ok = true;
     for (const k of [0, 1]) ok = (await grab("date=" + dayStr(k) + "&timezone=UTC")) && ok;
     if (ok) await state.updateOne({ _id: "matches" }, { $set: { realDailyAt: now } });
   }
-  if (FB_DAYS_AHEAD > 2 && (force || !st.realFutureAt || now - st.realFutureAt > 3 * 3600_000)) {   // بقية الأسبوع: كل 3 ساعات
+  if (FB_DAYS_AHEAD > 2 && (force || !st.realFutureAt || now - st.realFutureAt > FB_FUTURE_REFRESH_MS)) {   // بقية الأسبوع: كل 6 ساعات (افتراضياً)
     let ok = true;
     for (let k = 2; k < FB_DAYS_AHEAD; k++) ok = (await grab("date=" + dayStr(k) + "&timezone=UTC")) && ok;
     if (ok) await state.updateOne({ _id: "matches" }, { $set: { realFutureAt: now } });
   }
   const active = st.matches.filter((m) => m.real && m.status !== "ended" && m.startsAt <= now + 10 * 60_000).slice(0, 20).map((m) => m.fid);
-  if (active.length) await grab("ids=" + active.join("-") + "&timezone=UTC");    // تحديث النشطة (دقيقة/نتيجة/نهاية)
+  if (active.length && (force || !st.realLiveAt || now - st.realLiveAt > FB_LIVE_REFRESH_MS)) {    // تحديث النشطة (دقيقة/نتيجة/نهاية): كل 90 دقيقة (افتراضياً)
+    const needFinal = st.matches.some((m) => m.real && m.status !== "ended" && m.startsAt < now - 100 * 60_000);   // مباراة يُفترض أنها انتهت: نتيجتها لازمة للتسوية فلها أولوية كاملة
+    if (await grab("ids=" + active.join("-") + "&timezone=UTC", needFinal ? 1 : 0.85)) await state.updateOne({ _id: "matches" }, { $set: { realLiveAt: now } });
+  }
   const seen = new Set();
   let parsed = items.map(parseFixture).filter((p) => p && fbLeagueOk(p.leagueApiId) && !seen.has(p.id) && seen.add(p.id));
   /* حد أقصى لكل يوم (FOOTBALL_MAX_PER_DAY): الأهم أولاً — لا يمسّ المباريات الموجودة أصلاً (حتى لا تضيع رهانات) */
@@ -641,7 +646,10 @@ async function syncReal(cfg, force = false) {
 /** يضمن ألا ينزل أي يوم من الأسبوع القادم عن FOOTBALL_MIN_PER_DAY مباريات: يكمّله بمباريات تجريبية من قائمة الساحة */
 async function ensureDailyMin() {
   const st = await loadState();
-  if (!st.realDailyAt || (FB_DAYS_AHEAD > 2 && !st.realFutureAt)) return;     // لا تُكمِّل قبل أن يُجرَّب جلب المباريات الحقيقية
+  const cfg0 = await getConfig();
+  /* لا تُكمِّل قبل أن يُجرَّب جلب المباريات الحقيقية (نجح أو فشل). إن كان الجلب معطّلاً/بلا مفتاح/فاشلاً (حد يومي منتهٍ) تُكمَّل مباشرة حتى لا تبقى القائمة فارغة */
+  const realOn = cfg0.settings.realMatchesEnabled !== false && !!fbKey();
+  if (realOn && !st.realAt) return;
   const now = Date.now();
   const counts = new Map();
   for (const m of st.matches) { const d = utcDay(m.startsAt); counts.set(d, (counts.get(d) || 0) + 1); }
@@ -650,7 +658,7 @@ async function ensureDailyMin() {
   for (let k = 0; k < FB_DAYS_AHEAD; k++) {
     const day = utcDay(now + k * 86_400_000), need = FB_MIN_PER_DAY - (counts.get(day) || 0);
     if (need <= 0) continue;
-    const dayStart = Date.parse(day + "T00:00:00Z"), from = Math.max(now + 90 * 60_000, dayStart + 10 * 3600_000), to = dayStart + 22 * 3600_000;
+    const dayStart = Date.parse(day + "T00:00:00Z"), from = Math.max(now + 90 * 60_000, dayStart + 10 * 3600_000), to = dayStart + 23.5 * 3600_000;
     if (to <= from) continue;
     for (let i = 0; i < need; i++) {
       const seed = pool[(k * 7 + i) % pool.length];
@@ -2276,6 +2284,23 @@ const fbLeagueOk = (id) => FB_ALL_LEAGUES || FB_LEAGUE_SET.has(String(id));
 const FB_DAYS_AHEAD = Math.min(14, Math.max(1, Number(process.env.FOOTBALL_DAYS_AHEAD) || 7));
 const FB_MAX_PER_DAY = Math.max(10, Number(process.env.FOOTBALL_MAX_PER_DAY) || 100);
 const FB_MIN_PER_DAY = Math.max(1, Number(process.env.FOOTBALL_MIN_PER_DAY) || 6);
+/* حصة الطلبات اليومية لـ API-Sports (تُحفظ في قاعدة البيانات فتصمد عند إعادة تشغيل Vercel) */
+const FB_DAILY_BUDGET = Math.max(10, Number(process.env.FOOTBALL_DAILY_BUDGET) || 166);
+const FB_DAILY_REFRESH_MS = Math.max(10, Number(process.env.FOOTBALL_DAILY_REFRESH_MIN) || 60) * 60_000;   // اليوم والغد
+const FB_FUTURE_REFRESH_MS = Math.max(1, Number(process.env.FOOTBALL_FUTURE_REFRESH_HOURS) || 6) * 3600_000; // بقية الأسبوع
+const FB_LIVE_REFRESH_MS = Math.max(60, Number(process.env.FOOTBALL_LIVE_REFRESH_SEC) || 5400) * 1000;       // تحديث الحية/النتائج: كل 90 دقيقة
+/** يحجز طلباً واحداً من حصة اليوم (UTC). share<1 يترك جزءاً من الحصة لأعمال أهم (الجلب الأساسي ونتائج التسوية) */
+async function fbTakeDaily(share = 1) {
+  try {
+    const { meta } = await C();
+    const cap = Math.max(1, Math.floor(FB_DAILY_BUDGET * share));
+    const r = await meta.updateOne({ _id: `quota:fb:${utcDay(Date.now())}`, n: { $lt: cap } }, { $inc: { n: 1 } }, { upsert: true });
+    return r.modifiedCount === 1 || r.upsertedCount === 1;
+  } catch (e) {
+    if (e?.code === 11000) return false;   // الوثيقة موجودة وبلغت السقف
+    return true;                            // عطل آخر في العدّاد: لا نوقف الخدمة
+  }
+}
 /* أولوية الدوريات عند تجاوز حد اليوم (الأهم أولاً): كؤوس أوروبا والعالم والدوريات الكبرى ثم العربية والبقية */
 const FB_PRIORITY = [2, 3, 848, 1, 4, 5, 6, 9, 10, 15, 29, 30, 31, 32, 34, 39, 140, 135, 78, 61, 45, 143, 48, 81, 137, 66, 307, 233, 235, 12, 13, 11, 16, 17, 21, 22, 531, 88, 94, 144, 179, 203, 253, 262, 71, 128, 98, 169, 188, 292, 301, 305, 308, 332].map(String);
 const fbPrio = (id) => { const i = FB_PRIORITY.indexOf(String(id)); return i < 0 ? 999 : i; };
@@ -2359,7 +2384,7 @@ async function fbEntry(key, endpoint, qs, ttl) {
   if (fbInflight.has(key)) return { entry: await fbInflight.get(key), state: "WAIT" };
   const staleOk = hit && now - hit.exp < 10 * 60_000;
   const p = (async () => {
-    if (!fbTakeUpstreamToken()) {
+    if (!fbTakeUpstreamToken() || !(await fbTakeDaily(0.6))) {
       if (staleOk) return { ...hit, stale: true };
       throw new HttpError(429, "تجاوز حدّ الطلبات مؤقتاً، حاول بعد قليل");
     }
@@ -2389,7 +2414,11 @@ async function footballProxy(req, res, url, pathname) {
     if (!fbOriginAllowed(req)) return fbSend(res, 403, fbEnvelope(sub, { origin: "أصل غير مسموح" }));
     if (!fbIpAllowed(req)) return fbSend(res, 429, fbEnvelope(sub, { rateLimit: "طلبات كثيرة، حاول بعد قليل" }));
 
-    if (sub === "health") return fbSend(res, 200, { ok: true, configured: !!fbKey(), leagues: FB_LEAGUES });
+    if (sub === "health") {
+      let usedToday = null;
+      try { const { meta } = await C(); usedToday = (await meta.findOne({ _id: `quota:fb:${utcDay(Date.now())}` }))?.n ?? 0; } catch { /* العدّاد اختياري */ }
+      return fbSend(res, 200, { ok: true, configured: !!fbKey(), leagues: FB_LEAGUES, dailyBudget: FB_DAILY_BUDGET, usedToday });
+    }
     if (sub === "_status") {   // للأدمن فقط: حالة الخطة والحد اليومي (بدون إظهار المفتاح أو بيانات الحساب)
       if (!verifyAdminToken(req.headers["x-admin-token"])) return fbSend(res, 401, { ok: false, error: "يلزم تسجيل الدخول كمدير" });
       if (!fbKey()) return fbSend(res, 200, { ok: true, keyConfigured: false });
