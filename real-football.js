@@ -3,6 +3,11 @@
  *  ضعه بجانب server.js (نفس المجلد). لا يحتاج أي حزمة خارجية.
  *  فيه: خريطة الدوريات · أسماء الفرق بالعربية · تحويل مباراة API-Sports إلى مباراة ساحة
  *       · نموذج احتمالات المباراة الحية (بواسون) لتسعير الرهان أثناء اللعب.
+ *
+ *  تعديل: لم يعد الملف يحصر المباريات في الدوريات المعروفة. أي دوري/كأس في العالم يُقبل:
+ *   - الدوريات الموجودة في LEAGUE_MAP تحتفظ بمعرّفاتها القديمة (epl, laliga ...)
+ *   - أي دوري آخر يأخذ المعرّف w<رقم الدوري> ويحمل اسمه وشعاره ودولته داخل المباراة
+ *     (leagueName / leagueLogo / country / leagueFlag) لتعرضها الواجهة.
  * ============================================================================ */
 
 /* معرّف الدوري في API-Sports ← معرّف الدوري في التطبيق (data.js) */
@@ -57,12 +62,11 @@ function colorsOf(n) {                       // لونان ثابتان من ا�
 }
 const teamOf = (t) => ({ id: t?.id, name: arName(t?.name), nameEn: t?.name, short: shortOf(t?.name), colors: colorsOf(t?.name), logo: t?.logo || null });
 
-/* ---- تحويل مباراة API-Sports إلى حقول مباراة الساحة ---- */
+/* ---- تحويل مباراة API-Sports إلى حقول مباراة الساحة (كل دوريات وكؤوس العالم) ---- */
 export function parseFixture(it) {
   const f = it?.fixture, lg = it?.league;
   if (!f?.id || !lg?.id || !it.teams?.home || !it.teams?.away) return null;
-  const leagueId = LEAGUE_MAP[lg.id];
-  if (!leagueId) return null;
+  const leagueId = LEAGUE_MAP[lg.id] || `w${lg.id}`;   // دوري غير معروف ← w<رقم> بدل رفض المباراة
   const short = f.status?.short || "NS";
   const goals = [Number(it.goals?.home) || 0, Number(it.goals?.away) || 0];
   const ft = it.score?.fulltime;
@@ -73,6 +77,7 @@ export function parseFixture(it) {
   if (status === "ended") minute = 90;
   return {
     id: `r${f.id}`, fid: f.id, real: true, leagueId, leagueApiId: lg.id, apiStatus: short, status,
+    leagueName: lg.name || "", leagueLogo: lg.logo || "", country: lg.country || "", leagueFlag: lg.flag || "",
     startsAt: (Number(f.timestamp) || 0) * 1000, minute,
     score: status === "ended" && hasFt ? [ft.home, ft.away] : goals,   // التسوية تعتمد نتيجة الـ90 دقيقة
     round: lg.round || "", home: teamOf(it.teams.home), away: teamOf(it.teams.away),
