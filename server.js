@@ -27,16 +27,14 @@
  *
  *      --- وسيط كرة القدم API-Sports (Football Widgets) ---
  *      API_FOOTBALL_KEY            مفتاح API-Sports — يبقى هنا في السيرفر فقط ولا يصل للمتصفح أبداً
- *      FOOTBALL_LEAGUES            الدوريات المسموحة (الافتراضي 39,140 = الإنجليزي + الإسباني)
+ *      FOOTBALL_LEAGUES            الدوريات المسموحة (الافتراضي: كل دوريات وكؤوس العالم — ضع أرقاماً مفصولة بفواصل لحصرها)
+ *      FOOTBALL_DAYS_AHEAD         عدد الأيام القادمة المجلوبة (الافتراضي 7)
+ *      FOOTBALL_MAX_PER_DAY        أقصى عدد مباريات حقيقية لكل يوم (الافتراضي 100)
+ *      FOOTBALL_MIN_PER_DAY        أدنى عدد مباريات لكل يوم (الافتراضي 6) — يُكمَّل بمباريات تجريبية إن نقصت
  *      FOOTBALL_ALLOWED_ORIGINS    اختياري: أصول مسموحة مفصولة بفواصل، مثل https://my-app.netlify.app
  *      FOOTBALL_UPSTREAM_PER_MIN   حد الطلبات الصادرة لـ API-Sports في الدقيقة (الافتراضي 10 = حد الخطة المجانية)
  *      FOOTBALL_IP_PER_MIN         حد الطلبات لكل IP في الدقيقة (الافتراضي 120)
  *
- *      --- كرة السلة API-Basketball (قسم 🏀) ---
- *      API_BASKETBALL_KEY          مفتاح API-Sports لكرة السلة (إن غاب يُستعمل API_FOOTBALL_KEY — نفس مفتاح API-Sports يعمل للرياضتين)
- *      BASKETBALL_LEAGUES          الدوريات المسموحة (الافتراضي 12,120 = NBA + اليوروليغ)
- *      BASKETBALL_SEASON           اختياري: الموسم يدوياً مثل 2026-2027 (وإلا يُشتق تلقائياً)
- *      BASKETBALL_UPSTREAM_PER_MIN حد الطلبات الصادرة لـ API-Basketball في الدقيقة (الافتراضي 10)
  *
  *  محلياً: ضع المتغيّرات في ملف .env بجانب هذا الملف ثم: node server.js
  * ========================================================================== */
@@ -45,7 +43,6 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { parseFixture, liveDist, deadExact, effPools } from "./real-football.js";
-import { parseGame, parseStandings, teamStrength, tierOf, buildMarkets, priceOption, probOf, modelOf, outcomeOf, buildBbMatch, tickBb, manualMatch, BB_FIXTURES, bbBounds, MARKET_ORDER, tabLabel } from "./real-basketball.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /* ====================== محرك المجمّع (منسوخ من src/pool.js) ====================== */
@@ -333,17 +330,6 @@ const DEFAULT_SETTINGS = {
   liveRateGoalAvg: 2.7,     // معدل أهداف المباراة الكاملة المتوقّع (يؤثر على سرعة تغيّر النسب بعد الأهداف)
   liveRateNoisePct: 3,      // حركة عشوائية خفيفة كل 10 ثوانٍ (0 = بلا حركة)
   showSimMatches: true,     // إظهار مباريات الساحة التجريبية بجانب الحقيقية
-  /* ===== كرة السلة 🏀 ===== */
-  bbEnabled: true,          // تفعيل قسم كرة السلة
-  bbRealEnabled: true,      // جلب المباريات الحقيقية من API-Basketball
-  bbShowSim: true,          // إظهار مباريات السلة التجريبية بجانب الحقيقية
-  bbLiveBetting: true,      // الرهان أثناء مباريات السلة
-  bbRateMin: 0.4,           // أدنى نسبة ربح ٪ (الفريق القوي/النتيجة شبه المضمونة)
-  bbRateMax: 15,            // أعلى نسبة ربح ٪ (الفريق الضعيف/النتيجة شبه المستحيلة)
-  bbAutoRates: true,        // نسب تلقائية حسب قوة الفريق ونتائجه (إيقافه = نسبة ثابتة بالمنتصف)
-  bbNoisePct: 2,            // حركة عشوائية خفيفة للنسب كل 10 ثوانٍ (0 = بلا حركة)
-  bbLiveCutoffMin: 4,       // يُغلق الرهان قبل نهاية المباراة بهذه الدقائق (دقائق لعب)
-  bbSyncSec: 20,            // كل كم ثانية نحدّث المباريات الحية من API-Basketball
   minStake: 1, maxStake: 0, cashoutMarginPct: 0,
   platformFeePct: 0, // نسبة ربح المنصة المخصومة من مجمّع كل مباراة (0..50) — الافتراضي 0%، وتُعدَّل من لوحة الأدمن
   dailyBonusEnabled: true, commissionEnabled: true, autoDepositEnabled: true,
@@ -591,18 +577,34 @@ async function syncReal(cfg, force = false) {
   const st = await loadState();
   const items = [];
   const grab = async (qs) => {
-    if (!fbTakeUpstreamToken()) return;
+    if (!fbTakeUpstreamToken()) return false;
     const { status, json } = await fbUpstream("fixtures", qs);
-    if (status === 200 && !fbHasErrors(json) && Array.isArray(json.response)) items.push(...json.response);
+    if (status === 200 && !fbHasErrors(json) && Array.isArray(json.response)) { items.push(...json.response); return true; }
+    return false;
   };
-  if (force || !st.realDailyAt || now - st.realDailyAt > 15 * 60_000) {      // اكتشاف مباريات اليوم والغد
-    const d0 = new Date(now).toISOString().slice(0, 10), d1 = new Date(now + 86_400_000).toISOString().slice(0, 10);
-    await grab("date=" + d0 + "&timezone=UTC"); await grab("date=" + d1 + "&timezone=UTC");
-    await state.updateOne({ _id: "matches" }, { $set: { realDailyAt: now } });
+  const dayStr = (k) => utcDay(now + k * 86_400_000);
+  if (force || !st.realDailyAt || now - st.realDailyAt > 15 * 60_000) {      // اليوم والغد: كل 15 دقيقة
+    let ok = true;
+    for (const k of [0, 1]) ok = (await grab("date=" + dayStr(k) + "&timezone=UTC")) && ok;
+    if (ok) await state.updateOne({ _id: "matches" }, { $set: { realDailyAt: now } });
+  }
+  if (FB_DAYS_AHEAD > 2 && (force || !st.realFutureAt || now - st.realFutureAt > 3 * 3600_000)) {   // بقية الأسبوع: كل 3 ساعات
+    let ok = true;
+    for (let k = 2; k < FB_DAYS_AHEAD; k++) ok = (await grab("date=" + dayStr(k) + "&timezone=UTC")) && ok;
+    if (ok) await state.updateOne({ _id: "matches" }, { $set: { realFutureAt: now } });
   }
   const active = st.matches.filter((m) => m.real && m.status !== "ended" && m.startsAt <= now + 10 * 60_000).slice(0, 20).map((m) => m.fid);
   if (active.length) await grab("ids=" + active.join("-") + "&timezone=UTC");    // تحديث النشطة (دقيقة/نتيجة/نهاية)
-  const parsed = items.map(parseFixture).filter((p) => p && FB_LEAGUE_SET.has(String(p.leagueApiId)));
+  const seen = new Set();
+  let parsed = items.map(parseFixture).filter((p) => p && fbLeagueOk(p.leagueApiId) && !seen.has(p.id) && seen.add(p.id));
+  /* حد أقصى لكل يوم (FOOTBALL_MAX_PER_DAY): الأهم أولاً — لا يمسّ المباريات الموجودة أصلاً (حتى لا تضيع رهانات) */
+  const have = new Map(st.matches.filter((m) => m.real).map((m) => [m.id, m]));
+  const perDay = new Map();
+  for (const m of have.values()) { const d = utcDay(m.startsAt); perDay.set(d, (perDay.get(d) || 0) + 1); }
+  const fresh = parsed.filter((p) => !have.has(p.id) && p.status !== "ended" && p.status !== "void").sort((a, b) => fbPrio(a.leagueApiId) - fbPrio(b.leagueApiId) || a.startsAt - b.startsAt);
+  const drop = new Set();
+  for (const p of fresh) { const d = utcDay(p.startsAt); const n = perDay.get(d) || 0; if (n >= FB_MAX_PER_DAY) drop.add(p.id); else perDay.set(d, n + 1); }
+  parsed = parsed.filter((p) => !drop.has(p.id));
   if (!parsed.length) return { fetched: 0 };
   const ended = new Set(), voided = new Set();
   const ms = await mutateState((arr) => {
@@ -636,10 +638,35 @@ async function syncReal(cfg, force = false) {
   }
   return { fetched: parsed.length, ended: ended.size, voided: voided.size };
 }
+/** يضمن ألا ينزل أي يوم من الأسبوع القادم عن FOOTBALL_MIN_PER_DAY مباريات: يكمّله بمباريات تجريبية من قائمة الساحة */
+async function ensureDailyMin() {
+  const st = await loadState();
+  if (!st.realDailyAt || (FB_DAYS_AHEAD > 2 && !st.realFutureAt)) return;     // لا تُكمِّل قبل أن يُجرَّب جلب المباريات الحقيقية
+  const now = Date.now();
+  const counts = new Map();
+  for (const m of st.matches) { const d = utcDay(m.startsAt); counts.set(d, (counts.get(d) || 0) + 1); }
+  const pool = FIXTURES.filter((f) => f.inMinutes >= 0);
+  const adds = [];
+  for (let k = 0; k < FB_DAYS_AHEAD; k++) {
+    const day = utcDay(now + k * 86_400_000), need = FB_MIN_PER_DAY - (counts.get(day) || 0);
+    if (need <= 0) continue;
+    const dayStart = Date.parse(day + "T00:00:00Z"), from = Math.max(now + 90 * 60_000, dayStart + 10 * 3600_000), to = dayStart + 22 * 3600_000;
+    if (to <= from) continue;
+    for (let i = 0; i < need; i++) {
+      const seed = pool[(k * 7 + i) % pool.length];
+      const nm = buildMatch({ ...seed, inMinutes: Math.round((from + ((to - from) * (i + 0.5)) / need - now) / 60_000) }, 0);
+      nm.id = `s${day.replace(/-/g, "")}${i}`;
+      adds.push(nm);
+    }
+  }
+  if (!adds.length) return;
+  await mutateState((arr) => { const ids = new Set(arr.map((m) => m.id)); return [...arr, ...adds.filter((m) => !ids.has(m.id))]; });
+}
 /** يلحق المباريات بالوقت الحقيقي ويسوّي الرهانات للمباريات المنتهية */
 async function syncMatches() {
   const cfg = await getConfig();
   await syncReal(cfg).catch((e) => console.error("syncReal:", e?.message || e));
+  await ensureDailyMin().catch((e) => console.error("ensureDailyMin:", e?.message || e));
   const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
   const { state } = await C();
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -833,7 +860,6 @@ async function settleBets(endedIds, matches, { userId, onlyBetId } = {}) {
 }
 async function cashoutQuote(u, b, cfg, ms) {
   if (!cfg.settings.cashoutEnabled || u.frozen || b.status !== "open") return null;
-  if (b.sport === "basketball") return bbCashoutQuote(b, cfg);
   const m = findMatch(ms, b.matchId);
   if (!m) return null;
   const margin = 1 - (cfg.settings.cashoutMarginPct || 0) / 100;
@@ -849,7 +875,6 @@ async function refundBet(b, label) {
   if (!claimed) return false;
   await credit(b.userId, b.stake);
   await addTx(b.userId, { kind: "refund", amount: b.stake, label: `${label} ${b.matchLabel}` });
-  if (b.sport === "basketball") return true;   // كرة السلة بلا مجمّعات أموال
   await mutateState((ms) => ms.map((m) => {
     if (m.id !== b.matchId) return m;
     if (b.market === "result") {
@@ -903,7 +928,6 @@ route("GET", "/api/config", { auth: false, sync: false }, async ({ cfg }) => {
     maintenance: s.maintenance, maintenanceMsg: s.maintenanceMsg, announcement: s.announcement,
     bettingEnabled: s.bettingEnabled, depositsEnabled: s.depositsEnabled, withdrawalsEnabled: s.withdrawalsEnabled,
     liveBetting: s.liveBetting, liveCutoffMin: s.liveCutoffMin, goalPauseSec: s.goalPauseSec, cashoutEnabled: s.cashoutEnabled, cancelEnabled: s.cancelEnabled,
-    bbEnabled: s.bbEnabled, bbRateMin: s.bbRateMin, bbRateMax: s.bbRateMax, bbLiveBetting: s.bbLiveBetting,
     platformFeePct: s.platformFeePct, minStake: s.minStake, maxStake: s.maxStake, minWithdraw: s.minWithdraw, maxWithdraw: s.maxWithdraw, minDeposit: s.minDeposit, maxDeposit: s.maxDeposit,
     dailyBonusEnabled: s.dailyBonusEnabled, commissionEnabled: s.commissionEnabled, autoDepositEnabled: s.autoDepositEnabled,
     bonusBase: s.bonusBase, bonusPerStreak: s.bonusPerStreak, bonusCooldownHours: s.bonusCooldownHours,
@@ -1154,12 +1178,6 @@ route("GET", "/api/bets", async ({ user, query, cfg, matches }) => {
   const { bets } = await C();
   // شبكة أمان: تسوية أي رهان مفتوح لمباراة منتهية (لو فشلت التسوية سابقاً)
   const open = await bets.find({ userId: user._id, status: "open" }).toArray();
-  if (open.some((b) => b.sport === "basketball")) {   // 🏀 مزامنة كرة السلة وتسوية رهاناتها المنتهية
-    await syncBasket(cfg).catch((e) => console.error("syncBasket:", e?.message || e));
-    const bst = await bLoad();
-    const done = new Set(open.filter((b) => b.sport === "basketball" && bst.matches.find((x) => x.id === b.matchId)?.status === "ended").map((b) => b.matchId));
-    if (done.size) await bSettle(done, bst.matches, { userId: user._id });
-  }
   const endedIds = new Set(open.filter((b) => findMatch(matches, b.matchId)?.status === "ended").map((b) => b.matchId));
   if (endedIds.size) await settleBets(endedIds, matches, { userId: user._id });
   const f = { userId: user._id };
@@ -1268,13 +1286,6 @@ route("POST", "/api/bets/:id/cancel", async ({ user, params, cfg, matches }) => 
   const b = await findBet(user, params.id);
   if (b.status !== "open") throw bad("لا يمكن إلغاء هذا الرهان");
   if (!cfg.settings.cancelEnabled) throw forbid("إلغاء الرهان متوقف");
-  if (b.sport === "basketball") {
-    const bm = (await bLoad()).matches.find((x) => x.id === b.matchId);
-    if (bm && bm.status !== "upcoming") throw bad("لا يمكن الإلغاء بعد انطلاق المباراة");
-    await bRefund(b, "إلغاء رهان");
-    const u0 = await (await C()).users.findOne({ _id: user._id });
-    return { ok: true, balance: r2(u0.balance), bet: pub(await findBet(user, b._id)) };
-  }
   const m = findMatch(matches, b.matchId);
   if (m && m.status !== "upcoming") throw bad("لا يمكن الإلغاء بعد انطلاق المباراة");
   await refundBet(b, "إلغاء رهان");
@@ -1920,7 +1931,7 @@ route("POST", "/api/admin/matches/:id/compensate", A, async ({ params, body }) =
   let count = 0, total = 0;
   const players = new Set();
   for (const b of list) {
-    const amount = r2((b.stake * percent) / 100);
+    const amount = r2(Math.min(b.stake, (b.stake * percent) / 100));   // التعويض = مبلغ الرهان فقط (أو نسبة منه) — بدون أرباح ولا مضاعف أودز
     const claimed = await fau(bets, { _id: b._id, status: "lost", compensated: { $ne: true } }, { $set: { compensated: true, compensatedAmount: amount, compensatedAt: Date.now(), payout: amount } });
     if (!claimed) continue; // عُوِّض بالفعل (حماية من الضغط المزدوج)
     await credit(b.userId, amount);
@@ -2186,544 +2197,6 @@ route("POST", "/api/admin/import", A, async ({ body }) => {
   return { ok: true, imported: Object.keys(patch) };
 });
 
-/* ============================================================================
- *  🏀 كرة السلة — حالة المباريات + مزامنة API-Basketball + الرهان + التسوية + مسارات الأدمن
- *  حالة مستقلة تماماً عن كرة القدم (مستند "bmatches" في مجموعة state) ولا تمسّ منطقها.
- *  الرهانات تُخزَّن في نفس مجموعة bets بحقل sport:"basketball" فتظهر في «رهاناتي» ولوحة الأدمن.
- * ========================================================================== */
-const BB_HOST = (process.env.API_BASKETBALL_HOST || "https://v1.basketball.api-sports.io").replace(/\/+$/, "");
-const bbKey = () => process.env.API_BASKETBALL_KEY || process.env.API_FOOTBALL_KEY || process.env.APISPORTS_KEY || "";
-const BB_LEAGUE_SET = new Set((process.env.BASKETBALL_LEAGUES || "12,120").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x)));
-const BB_PER_MIN = Math.max(1, Number(process.env.BASKETBALL_UPSTREAM_PER_MIN) || 10);
-const bbBudget = { w: 0, n: 0 };
-const bbTakeToken = () => {
-  const w = Math.floor(Date.now() / 60_000);
-  if (bbBudget.w !== w) { bbBudget.w = w; bbBudget.n = 0; }
-  if (bbBudget.n >= BB_PER_MIN) return false;
-  bbBudget.n++; return true;
-};
-const bbHasErrors = (j) => { const e = j?.errors; return Array.isArray(e) ? e.length > 0 : !!e && typeof e === "object" && Object.keys(e).length > 0; };
-async function bbUpstream(endpoint, qs) {
-  const ctrl = new AbortController(), t = setTimeout(() => ctrl.abort(), 9000);
-  try {
-    const r = await fetch(`${BB_HOST}/${endpoint}${qs ? "?" + qs : ""}`, { headers: { "x-apisports-key": bbKey(), Accept: "application/json" }, signal: ctrl.signal });
-    const text = await r.text();
-    let json; try { json = JSON.parse(text); } catch { throw new HttpError(502, "ردّ غير صالح من مزوّد بيانات كرة السلة"); }
-    return { status: r.status, json };
-  } catch (e) {
-    if (e instanceof HttpError) throw e;
-    throw new HttpError(502, "تعذّر الوصول إلى مزوّد بيانات كرة السلة");
-  } finally { clearTimeout(t); }
-}
-const bbSeason = () => {
-  if (process.env.BASKETBALL_SEASON) return process.env.BASKETBALL_SEASON;
-  const d = new Date(), y = d.getUTCFullYear();
-  return d.getUTCMonth() >= 8 ? `${y}-${y + 1}` : `${y - 1}-${y}`;
-};
-
-/* ---------- الحالة (قفل تفاؤلي بالإصدار) ---------- */
-async function bLoad() {
-  const { state } = await C();
-  let st = await state.findOne({ _id: "bmatches" });
-  if (!st) {
-    st = { _id: "bmatches", version: 1, lastTickAt: Date.now(), matches: BB_FIXTURES.map((f, i) => buildBbMatch(f, i)), strength: {} };
-    try { await state.insertOne(st); } catch { st = await state.findOne({ _id: "bmatches" }); }
-  }
-  return st;
-}
-async function bMutate(fn) {
-  const { state } = await C();
-  for (let i = 0; i < 8; i++) {
-    const st = await bLoad();
-    const next = fn(st.matches);
-    const r = await state.updateOne({ _id: "bmatches", version: st.version }, { $set: { matches: next, version: st.version + 1 } });
-    if (r.modifiedCount === 1) return next;
-  }
-  throw new HttpError(503, "ضغط عالٍ، حاول مجدداً بعد لحظة");
-}
-const bFind = (ms, id) => ms.find((m) => m.id === id);
-/** قوة الفريق من سجل الترتيب (إن وُجد) — تُطبَّق على كل مباراة */
-function withStrength(m, map) {
-  const one = (t) => {
-    const rec = t.apiId != null ? map?.[t.apiId] : null;
-    const s = rec ? teamStrength(rec, m.len) : null;
-    const strength = s ?? (typeof t.strength === "number" ? t.strength : 0.5);
-    return { ...t, strength, tier: tierOf(strength), record: rec && rec.win != null ? `${rec.win}-${Math.max(0, (rec.gp || 0) - rec.win)}` : t.record, form: rec?.form || t.form, strengthSrc: rec ? "api" : t.strengthSrc || "default" };
-  };
-  return { ...m, home: one(m.home), away: one(m.away) };
-}
-/** الدقيقة المقدّرة للمباراة الحقيقية (الـ API لا يعطي ساعة دقيقة، فنقدّر من لحظة بدء الربع) */
-function bbEstMinute(p, periodAt, now) {
-  const L = p.len, qL = L / 4;
-  if (p.status === "ended") return L;
-  if (p.status !== "live") return 0;
-  if (p.brk) return p.apiStatus === "HT" ? L / 2 : p.period * qL;
-  if (p.period >= 5) return +(L + clampN((now - periodAt) / (2.2 * 60_000), 0, 4.8, 0)).toFixed(1);
-  return +((p.period - 1) * qL + clampN((now - periodAt) / (2.4 * 60_000), 0, qL - 0.2, 0)).toFixed(1);
-}
-async function bSyncReal(cfg, force = false) {
-  const s = cfg.settings;
-  if (s.bbRealEnabled === false || !bbKey() || (s.simPaused && !force)) return { skipped: true };
-  const { state } = await C();
-  await bLoad();   // يضمن وجود مستند الحالة قبل حجز دور المزامنة
-  const now = Date.now();
-  const gap = force ? 0 : Math.max(10, Number(s.bbSyncSec) || 20) * 1000;
-  const claim = await state.updateOne({ _id: "bmatches", $or: [{ realAt: { $lt: now - gap } }, { realAt: { $exists: false } }] }, { $set: { realAt: now } });
-  if (claim.modifiedCount !== 1) return { skipped: true };
-  const st = await bLoad();
-  const items = [], got = new Set();
-  let lastErr = "";
-  const grab = async (endpoint, qs) => {
-    if (!bbTakeToken()) return null;
-    const { status, json } = await bbUpstream(endpoint, qs);
-    if (status !== 200 || bbHasErrors(json)) { lastErr = JSON.stringify(json?.errors || json?.message || status).slice(0, 200); return null; }
-    return json;
-  };
-  const grabGames = async (qs) => { const j = await grab("games", qs); if (j && Array.isArray(j.response)) items.push(...j.response); return !!j; };
-  /* قوة الفرق: من ترتيب الدوريات كل 6 ساعات */
-  let strength = st.strength || {};
-  if (force || !st.strengthAt || now - st.strengthAt > 6 * 3600_000) {
-    let okAny = false;
-    for (const lg of [...BB_LEAGUE_SET].slice(0, 4)) {
-      const j = await grab("standings", `league=${lg}&season=${bbSeason()}`);
-      if (j) { Object.assign(strength, parseStandings(j)); okAny = true; }
-    }
-    await state.updateOne({ _id: "bmatches" }, { $set: { strength, strengthAt: okAny ? now : now - 5 * 3600_000 } });
-  }
-  /* اكتشاف مباريات اليوم (كل 30 د) والغد (كل 3 ساعات) */
-  const d0 = new Date(now).toISOString().slice(0, 10), d1 = new Date(now + 86_400_000).toISOString().slice(0, 10);
-  if (force || !st.realDailyAt || now - st.realDailyAt > 30 * 60_000) {
-    await grabGames(`date=${d0}&timezone=UTC`);
-    await state.updateOne({ _id: "bmatches" }, { $set: { realDailyAt: now } });
-  }
-  if (force || !st.realTomorrowAt || now - st.realTomorrowAt > 3 * 3600_000) {
-    await grabGames(`date=${d1}&timezone=UTC`);
-    await state.updateOne({ _id: "bmatches" }, { $set: { realTomorrowAt: now } });
-  }
-  /* المباريات النشطة: live=all ثم الاستعلام عن أي مباراة اختفت من البث (انتهت) */
-  const active = st.matches.filter((m) => m.real && m.status !== "ended" && m.startsAt <= now + 10 * 60_000);
-  if (active.length) {
-    const before = items.length;
-    await grabGames("live=all");
-    for (const it of items.slice(before)) got.add(it.id);
-    const missing = active.filter((m) => !got.has(m.fid) && (m.status === "live" || now - m.startsAt > 3 * 3600_000)).slice(0, 3);
-    for (const m of missing) await grabGames(`id=${m.fid}&timezone=UTC`);
-  }
-  const uniq = new Map();
-  for (const it of items) { const p = parseGame(it); if (p && BB_LEAGUE_SET.has(String(p.leagueApiId))) uniq.set(p.id, p); }
-  const parsed = [...uniq.values()];
-  if (!parsed.length) return { fetched: 0, error: lastErr || undefined };
-  const ended = new Set(), voided = new Set();
-  const ms = await bMutate((arr) => {
-    ended.clear(); voided.clear();
-    const out = arr.slice(), idx = new Map(arr.map((m, i) => [m.id, i]));
-    for (const p of parsed) {
-      const i = idx.get(p.id);
-      if (i === undefined) {
-        if (p.status === "ended" || p.status === "void") continue;
-        const nm = withStrength({ ...p, periodAt: now - 0.4 * (p.len / 4) * 2.4 * 60_000, minute: 0 }, strength);
-        nm.minute = bbEstMinute(nm, nm.periodAt, now);
-        delete nm._qL; out.push(nm); idx.set(p.id, out.length - 1); continue;
-      }
-      const m = out[i];
-      if (!m.real || m.status === "ended") continue;
-      if (p.status === "void") { voided.add(m.id); continue; }
-      const periodAt = p.period !== m.period || !m.periodAt ? now - (m.periodAt ? 0 : 0.4 * (p.len / 4) * 2.4 * 60_000) : m.periodAt;
-      const next = withStrength({
-        ...m, apiStatus: p.apiStatus, status: p.status, startsAt: p.startsAt, period: p.period, brk: p.brk, periodAt, len: p.len,
-        leagueName: p.leagueName, leagueLogo: p.leagueLogo, country: p.country,
-        home: { ...m.home, logo: p.home.logo || m.home.logo }, away: { ...m.away, logo: p.away.logo || m.away.logo },
-      }, strength);
-      if (p.status === "live" || p.status === "ended") { next.score = p.score; next.q = p.q; next.ot = p.ot; }
-      next.minute = bbEstMinute({ ...p, status: p.status }, periodAt, now);
-      if (p.status === "ended") { next.endedAt = now; next.minute = p.len; ended.add(m.id); }
-      out[i] = next;
-    }
-    return out.filter((m) => !voided.has(m.id));
-  });
-  if (ended.size) await bSettle(ended, ms).catch((e) => console.error("bSettle real:", e));
-  if (voided.size) {
-    const { bets } = await C();
-    for (const id of voided) for (const b of await bets.find({ status: "open", matchId: id }).toArray()) await bRefund(b, "إلغاء المباراة").catch(() => undefined);
-  }
-  return { fetched: parsed.length, ended: ended.size, voided: voided.size, error: lastErr || undefined };
-}
-function bReplenish(ms, now) {
-  const stale = (m) => m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS;
-  const gone = ms.filter((m) => !m.real && !m.manual && stale(m)).length;
-  const keep = ms.filter((m) => !stale(m));
-  for (let i = 0; i < gone; i++) {
-    const seed = BB_FIXTURES[Math.floor(Math.random() * BB_FIXTURES.length)];
-    const nm = buildBbMatch({ ...seed, inMinutes: 20 + Math.floor(Math.random() * 600) }, 0, now);
-    nm.id = `b${now.toString(36)}${i}`; keep.push(nm);
-  }
-  return keep;
-}
-/** يلحق مباريات السلة بالوقت (حقيقي + تجريبي) ويسوّي الرهانات المنتهية */
-async function syncBasket(cfg) {
-  if (cfg.settings.bbEnabled === false) return (await bLoad()).matches;
-  await bSyncReal(cfg).catch((e) => console.error("bSyncReal:", e?.message || e));
-  const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
-  const { state } = await C();
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const st = await bLoad(), now = Date.now();
-    if (cfg.settings.simPaused) {
-      if (now - st.lastTickAt > speed) await state.updateOne({ _id: "bmatches", version: st.version }, { $set: { lastTickAt: now } });
-      return st.matches;
-    }
-    const ticks = Math.floor((now - st.lastTickAt) / speed);
-    const stale = st.matches.some((m) => m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS);
-    if (ticks < 1 && !stale) return st.matches;
-    const n = Math.min(ticks, MAX_CATCHUP);
-    let ms = st.matches;
-    const ended = new Set();
-    for (let i = 0; i < n; i++) { const r = tickBb(ms, now); ms = r.matches; r.ended.forEach((id) => ended.add(id)); }
-    ms = bReplenish(ms, now);
-    const newLast = ticks >= MAX_CATCHUP ? now : st.lastTickAt + n * speed;
-    const r = await state.updateOne({ _id: "bmatches", version: st.version }, { $set: { matches: ms, lastTickAt: newLast, version: st.version + 1 } });
-    if (r.modifiedCount === 1) {
-      if (ended.size) await bSettle(ended, ms).catch((e) => console.error("bSettle:", e));
-      return ms;
-    }
-  }
-  return (await bLoad()).matches;
-}
-
-/* ---------- العرض للواجهة ---------- */
-const periodLabel = (m) => {
-  if (m.status === "ended") return "انتهت";
-  if (m.status !== "live") return "";
-  if (m.apiStatus === "SUSP") return "متوقفة مؤقتاً";
-  if ((m.period || 0) >= 5) return "وقت إضافي";
-  if (m.brk) return m.apiStatus === "HT" || m.period === 2 ? "استراحة" : `استراحة بعد الربع ${m.period}`;
-  return `الربع ${m.period || 1}`;
-};
-const bbTeam = (t) => ({ name: t.name, nameEn: t.nameEn || "", short: t.short, colors: t.colors, logo: t.logo || "", strength: +(t.strength ?? 0.5).toFixed(3), tier: t.tier || tierOf(t.strength ?? 0.5), record: t.record || null, form: t.form || null, strengthSrc: t.strengthSrc || "default" });
-function bbBase(m) {
-  return {
-    id: m.id, sport: "basketball", real: !!m.real, manual: !!m.manual, leagueId: m.leagueId, leagueName: m.leagueName, leagueLogo: m.leagueLogo || "", country: m.country || "",
-    home: bbTeam(m.home), away: bbTeam(m.away), startsAt: m.startsAt, status: m.status, apiStatus: m.apiStatus || null,
-    period: m.period || 0, periodLabel: periodLabel(m), minute: +(m.minute || 0).toFixed(1), len: m.len, score: m.score, q: m.q, ot: !!m.ot,
-    hot: !!m.hot, suspended: !!m.suspended, frozen: !!m.frozen, brk: !!m.brk,
-  };
-}
-const bbSummary = (m, S) => {
-  const mk = buildMarkets(m, S);
-  const pick = (k) => mk.find((x) => x.key === k);
-  return { ...bbBase(m), ml: pick("ml")?.options || [], mainSpread: pick("sp")?.mainLine ?? null, mainTotal: pick("tot")?.mainLine ?? null, closed: !pick("ml")?.open };
-};
-const bbDetail = (m, S) => ({
-  ...bbBase(m), markets: buildMarkets(m, S), tabs: tabLabel, order: MARKET_ORDER, bounds: bbBounds(S),
-  edge: m.edge || 0, totalBase: m.totalBase || null, sOv: m.sOv || null, manualRates: m.manualRates || null, staked: m.staked || 0, betsCount: m.bets || 0,
-});
-const bbVisible = (ms, S) => ms.filter((m) => m.real || m.manual || S.bbShowSim !== false);
-
-/* ---------- المال والتسوية ---------- */
-async function bRefund(b, label) {
-  const { bets } = await C();
-  const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "cashedout", payout: b.stake, settledAt: Date.now() } });
-  if (!claimed) return false;
-  await credit(b.userId, b.stake);
-  await addTx(b.userId, { kind: "refund", amount: b.stake, label: `${label} ${b.matchLabel}` });
-  await bMutate((ms) => ms.map((m) => (m.id === b.matchId ? { ...m, staked: r2(Math.max(0, (m.staked || 0) - b.stake)), bets: Math.max(0, (m.bets || 0) - 1) } : m))).catch(() => undefined);
-  return true;
-}
-async function bSettle(endedIds, matches, { userId, onlyBetId } = {}) {
-  const { bets, users } = await C();
-  const filter = { status: "open", sport: "basketball", matchId: { $in: [...endedIds] } };
-  if (userId !== undefined) filter.userId = userId;
-  if (onlyBetId) filter._id = onlyBetId;
-  const list = await bets.find(filter).sort({ createdAt: 1 }).toArray();
-  const events = [];
-  for (const b of list) {
-    const m = bFind(matches, b.matchId);
-    if (!m || m.status !== "ended") continue;
-    const u = await users.findOne({ _id: b.userId });
-    if (!u) continue;
-    const res = outcomeOf(m, b), sc = `${m.score[0]}-${m.score[1]}`;
-    if (res === "push") {
-      if (await bRefund(b, "استرداد (تعادل في السوق)")) { await addNotice(u._id, { title: "↩️ تم استرداد رهانك", body: `${b.matchLabel} (${sc}) — ${b.pickLabel || b.pick}: تعادل في هذا السوق فأُعيد مبلغك.`, tone: "info" }); events.push({ userId: u._id, betId: b._id, status: "refund" }); }
-    } else if (res === "won") {
-      const payout = payoutOf(b.stake, b.odds, 0);
-      const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "won", payout, settledAt: Date.now() } });
-      if (!claimed) continue;
-      await users.updateOne({ _id: u._id }, { $inc: { balance: payout, streak: 1, vipXp: Math.round(b.stake) }, $set: { bestStreak: Math.max(u.bestStreak || 0, (u.streak || 0) + 1) } });
-      await addTx(u._id, { kind: "win", amount: payout, label: `فوز ${b.matchLabel} — ${b.pickLabel || b.pick}` });
-      await addNotice(u._id, { title: `🏀🏆 فزت $${payout}!`, body: `${b.matchLabel} انتهت ${sc} وتوقّعك «${b.pickLabel || b.pick}» أصاب!`, tone: "success" });
-      events.push({ userId: u._id, betId: b._id, status: "won" });
-    } else {
-      const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "lost", payout: 0, settledAt: Date.now() } });
-      if (!claimed) continue;
-      await users.updateOne({ _id: u._id }, { $set: { streak: 0 } });
-      await addNotice(u._id, { title: "انتهى الرهان", body: `${b.matchLabel} انتهت ${sc} — حظاً أوفر في القادمة.`, tone: "alert" });
-      events.push({ userId: u._id, betId: b._id, status: "lost" });
-    }
-  }
-  return events;
-}
-async function bbCashoutQuote(b, cfg) {
-  const m = bFind((await bLoad()).matches, b.matchId);
-  if (!m || m.status === "ended" || m.status === "void") return null;
-  const margin = 1 - (cfg.settings.cashoutMarginPct || 0) / 100;
-  if (m.status !== "live") return r2(b.stake * 0.97 * margin);
-  const pr = priceOption(m, cfg.settings, b.market, b.pick);
-  if (!pr) return null;
-  if (!pr.open && ["h1", "q1", "htft", "hq", "ot"].includes(b.market)) return null;   // نتيجتها صارت شبه محسومة من الأرباع
-  return r2(Math.max(0, b.stake * b.odds * pr.p * 0.98) * margin);
-}
-/** عمولة الإحالات على رهان السلة (نفس نظام كرة القدم: 3 مستويات بعد التأهيل) */
-async function bbReferral(user, stake, s) {
-  if (!user.referredBy || !s.commissionEnabled) return;
-  const { refs } = await C();
-  const ref = await refs.findOne({ userId: user._id });
-  if (!ref) return;
-  const inc = { wagered: stake };
-  if (ref.qualified === true) {
-    inc.commissionEarned = r2(stake * REF_RATES[0]);
-    const up1 = await refs.findOne({ userId: ref.inviterId });
-    if (up1) {
-      inc.commissionL2 = r2(stake * REF_RATES[1]);
-      const up2 = await refs.findOne({ userId: up1.inviterId });
-      if (up2) inc.commissionL3 = r2(stake * REF_RATES[2]);
-    }
-  }
-  await refs.updateOne({ userId: user._id }, { $inc: inc, $set: { active: true } });
-}
-
-/* ---------- مسارات المستخدم ---------- */
-const BBP = { auth: false, sync: false };
-route("GET", "/api/basket/matches", BBP, async ({ query, cfg }) => {
-  const S = cfg.settings;
-  if (S.bbEnabled === false) return { enabled: false, matches: [], bounds: bbBounds(S) };
-  const ms = bbVisible(await syncBasket(cfg), S);
-  let list = ms;
-  if (query.status) list = list.filter((m) => m.status === query.status);
-  return { enabled: true, at: Date.now(), bounds: bbBounds(S), matches: list.filter((m) => m.status !== "void").map((m) => bbSummary(m, S)) };
-});
-route("GET", "/api/basket/matches/:id", BBP, async ({ params, cfg }) => {
-  const m = bFind(await syncBasket(cfg), params.id);
-  if (!m) throw notFound("المباراة غير موجودة");
-  return bbDetail(m, cfg.settings);
-});
-route("POST", "/api/basket/bets", { sync: false }, async ({ user, body, cfg }) => {
-  assertActive(user, cfg);
-  const s = cfg.settings, stake = Number(body.stake);
-  if (s.bbEnabled === false) throw forbid("قسم كرة السلة متوقف حالياً");
-  const key = String(body.market || ""), pick = String(body.pick || "");
-  const ms0 = await syncBasket(cfg);
-  const m0 = bFind(ms0, body.matchId);
-  if (!m0) throw bad("المباراة غير متوفرة");
-  const check = (m) => {
-    if (!s.bettingEnabled) throw forbid("الرهان متوقف حالياً");
-    if (m.suspended) throw bad("الرهان على هذه المباراة موقوف مؤقتاً");
-    if (m.status === "ended" || m.status === "void") throw bad("المباراة انتهت");
-    if (m.status === "live" && (!s.liveBetting || s.bbLiveBetting === false)) throw bad("الرهان أثناء المباراة متوقف حالياً");
-    const pr = priceOption(m, s, key, pick);
-    if (!pr) throw bad("خيار غير صالح");
-    if (!pr.open) throw bad("هذا السوق أُغلق الآن");
-    if (pr.locked) throw bad("هذا الخيار مغلق حالياً (نتيجته شبه محسومة)");
-    return pr;
-  };
-  check(m0);
-  if (!(stake > 0)) throw bad("أدخل مبلغاً صحيحاً");
-  if (stake < s.minStake) throw bad(`أدنى رهان $${s.minStake}`);
-  if (s.maxStake > 0 && stake > s.maxStake) throw bad(`أقصى رهان $${s.maxStake}`);
-  if (stake > user.balance) throw bad("رصيدك غير كافٍ");
-  if (user.limits.maxStake > 0 && stake > user.limits.maxStake) throw bad(`حد الرهان الأقصى لديك $${user.limits.maxStake}`);
-  if (user.limits.selfExcludedUntil && Date.now() < user.limits.selfExcludedUntil) throw forbid("أنت في فترة إيقاف ذاتي");
-  const { bets } = await C();
-  if (user.limits.dailyLossLimit > 0) {
-    const since = new Date().setHours(0, 0, 0, 0);
-    const today = await bets.find({ userId: user._id, status: "lost", compensated: { $ne: true }, createdAt: { $gte: since } }).toArray();
-    if (today.reduce((a, b) => a + b.stake, 0) >= user.limits.dailyLossLimit) throw forbid("بلغت حد الخسارة اليومي");
-  }
-  const after = await debit(user._id, stake);
-  if (!after) throw bad("رصيدك غير كافٍ");
-  let pr, matchLabel;
-  try {
-    await bMutate((ms) => {
-      const m = bFind(ms, m0.id);
-      if (!m) throw bad("المباراة غير متوفرة");
-      pr = check(m);   // النسبة تُقفل لحظة التنفيذ من أحدث حالة
-      matchLabel = `${m.home.name} × ${m.away.name}`;
-      return ms.map((x) => (x.id === m.id ? { ...x, staked: r2((x.staked || 0) + stake), bets: (x.bets || 0) + 1 } : x));
-    });
-  } catch (e) { await credit(user._id, stake); throw e; }
-  const odds = oddsFromRate(pr.rate);
-  const bet = {
-    _id: uid(), userId: user._id, sport: "basketball", matchId: m0.id, matchLabel, market: key, pick, pickLabel: pr.label, optIndex: -1, stake, odds, rate: pr.rate,
-    status: "open", payout: 0, createdAt: Date.now(), streakBonus: 0,
-  };
-  await bets.insertOne(bet);
-  await addTx(user._id, { kind: "bet", amount: -stake, label: `🏀 رهان ${matchLabel} — ${pr.label}` });
-  await bbReferral(user, stake, s);
-  const u = await (await C()).users.findOne({ _id: user._id });
-  return { ok: true, bet: pub(bet), balance: r2(u.balance) };
-});
-
-/* ---------- مسارات الأدمن ---------- */
-const bbStrengthList = (st) => Object.entries(st.strength || {}).map(([id, r]) => ({ id, name: r.name, winPct: r.winPct, form: r.form, gp: r.gp, strength: teamStrength(r) })).filter((x) => x.strength != null).sort((a, b) => b.strength - a.strength).slice(0, 60).map((x) => ({ ...x, tier: tierOf(x.strength) }));
-route("GET", "/api/admin/basket/state", { admin: true, sync: false }, async ({ cfg }) => {
-  const S = cfg.settings, ms = await syncBasket(cfg), st = await bLoad();
-  const keys = ["bbEnabled", "bbRealEnabled", "bbShowSim", "bbLiveBetting", "bbRateMin", "bbRateMax", "bbAutoRates", "bbNoisePct", "bbLiveCutoffMin", "bbSyncSec"];
-  return {
-    settings: Object.fromEntries(keys.map((k) => [k, S[k]])), hasKey: !!bbKey(), leagues: [...BB_LEAGUE_SET], season: bbSeason(),
-    strengthAt: st.strengthAt || 0, teams: bbStrengthList(st), bounds: bbBounds(S),
-    matches: ms.filter((m) => m.status !== "void").map((m) => bbDetail(m, S)),
-  };
-});
-route("POST", "/api/admin/basket/matches", { admin: true, sync: false }, async ({ body, cfg }) => {
-  for (const k of ["home", "away"]) if (!body?.[k] || (typeof body[k] === "object" && !body[k].name)) throw bad(`الحقل ${k} مطلوب`);
-  const nm = { ...manualMatch(body, `bm${Date.now().toString(36)}`), manual: true };
-  nm.home = { ...nm.home, logo: cleanLogo(nm.home.logo) }; nm.away = { ...nm.away, logo: cleanLogo(nm.away.logo) }; nm.leagueLogo = cleanLogo(nm.leagueLogo);
-  await bMutate((ms) => [...ms, nm]);
-  await adminLog(`🏀 إضافة مباراة سلة ${nm.id}`);
-  return bbDetail(nm, cfg.settings);
-});
-const BB_PATCH = ["hot", "suspended", "frozen", "startsAt", "leagueName", "leagueLogo", "country", "home", "away", "minute", "period", "status", "len", "edge", "totalBase", "sOv", "score", "q", "ot"];
-route("PATCH", "/api/admin/basket/matches/:id", { admin: true, sync: false }, async ({ params, body, cfg }) => {
-  let out;
-  await bMutate((ms) => {
-    if (!bFind(ms, params.id)) throw notFound("المباراة غير موجودة");
-    return ms.map((m) => {
-      if (m.id !== params.id) return m;
-      const n = { ...m };
-      for (const k of BB_PATCH) {
-        if (body[k] === undefined) continue;
-        if (k === "home" || k === "away") n[k] = { ...m[k], ...body[k], logo: cleanLogo(body[k]?.logo ?? m[k].logo), strength: typeof body[k]?.strength === "number" ? clampN(body[k].strength, 0.02, 0.98, 0.5) : m[k].strength };
-        else if (k === "edge") n.edge = clampN(body.edge, -20, 20, 0);
-        else if (k === "totalBase") n.totalBase = body.totalBase ? clampN(body.totalBase, 100, 400, 0) || null : null;
-        else if (k === "sOv") n.sOv = body.sOv ? { h: body.sOv.h === "" || body.sOv.h == null ? undefined : clampN(body.sOv.h, 0.02, 0.98, 0.5), a: body.sOv.a === "" || body.sOv.a == null ? undefined : clampN(body.sOv.a, 0.02, 0.98, 0.5) } : null;
-        else if (k === "score") n.score = [Math.max(0, Math.floor(Number(body.score[0]) || 0)), Math.max(0, Math.floor(Number(body.score[1]) || 0))];
-        else n[k] = body[k];
-      }
-      return (out = n);
-    });
-  });
-  await adminLog(`🏀 تعديل مباراة سلة ${params.id}`);
-  return bbDetail(out, cfg.settings);
-});
-route("DELETE", "/api/admin/basket/matches/:id", { admin: true, sync: false }, async ({ params }) => {
-  const { bets } = await C();
-  const open = await bets.find({ matchId: params.id, status: "open", sport: "basketball" }).toArray();
-  for (const b of open) await bRefund(b, "إلغاء مباراة");
-  await bMutate((ms) => { if (!bFind(ms, params.id)) throw notFound("المباراة غير موجودة"); return ms.filter((m) => m.id !== params.id); });
-  await adminLog(`🏀 حذف مباراة سلة ${params.id}`);
-  return { ok: true, refunded: open.length };
-});
-/** نقاط يدوية: side = home|away ، pts = ‎+1/+2/+3 أو -1 للتصحيح — تُسجَّل في ربع المباراة الحالي */
-route("POST", "/api/admin/basket/matches/:id/points", { admin: true, sync: false }, async ({ params, body, cfg }) => {
-  const side = body?.side === "away" ? 1 : 0, pts = Math.trunc(Number(body?.pts) || 0);
-  if (!pts || Math.abs(pts) > 4) throw bad("قيمة نقاط غير صالحة");
-  let out;
-  await bMutate((ms) => {
-    if (!bFind(ms, params.id)) throw notFound("المباراة غير موجودة");
-    return ms.map((m) => {
-      if (m.id !== params.id) return m;
-      const score = [...m.score]; score[side] = Math.max(0, score[side] + pts);
-      const key = side === 0 ? "h" : "a", qi = (m.period || 1) >= 5 ? 4 : Math.max(0, Math.min(3, (m.period || 1) - 1));
-      const q = { h: [...(m.q?.h || [0, 0, 0, 0, 0])], a: [...(m.q?.a || [0, 0, 0, 0, 0])] };
-      q[key][qi] = Math.max(0, (q[key][qi] || 0) + pts);
-      return (out = { ...m, score, q });
-    });
-  });
-  return bbDetail(out, cfg.settings);
-});
-route("POST", "/api/admin/basket/matches/:id/start", { admin: true, sync: false }, async ({ params, cfg }) => {
-  let out;
-  await bMutate((ms) => {
-    if (!bFind(ms, params.id)) throw notFound("المباراة غير موجودة");
-    return ms.map((m) => (m.id === params.id ? (out = { ...m, status: "live", minute: Math.max(1, m.minute || 0), period: Math.max(1, m.period || 1), startsAt: Math.min(m.startsAt, Date.now()), periodAt: Date.now() }) : m));
-  });
-  await adminLog(`🏀 بدء مباراة سلة ${params.id}`);
-  return bbDetail(out, cfg.settings);
-});
-/** إنهاء + تسوية. body: {home, away} نتيجة نهائية ، و q:{h:[4-5],a:[4-5]} لأرباع المباراة (لتسوية الشوط/الربع) */
-route("POST", "/api/admin/basket/matches/:id/end", { admin: true, sync: false }, async ({ params, body, cfg }) => {
-  let out;
-  const ms = await bMutate((arr) => {
-    if (!bFind(arr, params.id)) throw notFound("المباراة غير موجودة");
-    return arr.map((m) => {
-      if (m.id !== params.id) return m;
-      const n = { ...m, status: "ended", endedAt: Date.now(), minute: m.len, brk: false };
-      if (Number.isFinite(Number(body?.home)) && Number.isFinite(Number(body?.away))) n.score = [Math.max(0, Math.floor(Number(body.home))), Math.max(0, Math.floor(Number(body.away)))];
-      if (Array.isArray(body?.q?.h) && Array.isArray(body?.q?.a)) {
-        const fix = (a) => [0, 1, 2, 3, 4].map((i) => (a[i] === null || a[i] === undefined || a[i] === "" || !Number.isFinite(Number(a[i])) ? (i === 4 ? 0 : null) : Math.max(0, Math.floor(Number(a[i])))));
-        n.q = { h: fix(body.q.h), a: fix(body.q.a) };
-        n.ot = (n.q.h[4] || 0) + (n.q.a[4] || 0) > 0;
-      }
-      return (out = n);
-    });
-  });
-  const ev = await bSettle(new Set([params.id]), ms);
-  await adminLog(`🏀 إنهاء مباراة سلة ${params.id}`);
-  return { match: bbDetail(out, cfg.settings), settled: ev.length };
-});
-route("PUT", "/api/admin/basket/matches/:id/rates", { admin: true, sync: false }, async ({ params, body, cfg }) => {
-  const { lo, hi } = bbBounds(cfg.settings);
-  let out;
-  await bMutate((ms) => {
-    const m = bFind(ms, params.id);
-    if (!m) throw notFound("المباراة غير موجودة");
-    return ms.map((x) => {
-      if (x.id !== m.id) return x;
-      if (body?.auto) {   // عودة للتلقائي: سوق واحد أو الكل
-        const mr = { ...(x.manualRates || {}) };
-        if (body.market) delete mr[body.market]; else for (const k of Object.keys(mr)) delete mr[k];
-        return (out = { ...x, manualRates: Object.keys(mr).length ? mr : null });
-      }
-      if (!MARKET_ORDER.includes(body?.market) || typeof body?.rates !== "object" || !body.rates) throw bad("بيانات غير صالحة");
-      const cur = { ...((x.manualRates || {})[body.market] || {}) };
-      for (const [id, v] of Object.entries(body.rates)) {
-        if (v === null || v === "") { delete cur[id]; continue; }
-        if (!Number.isFinite(Number(v))) throw bad("نسبة غير صالحة");
-        cur[id] = +clampN(v, lo, hi, hi).toFixed(2);
-      }
-      return (out = { ...x, manualRates: { ...(x.manualRates || {}), [body.market]: cur } });
-    });
-  });
-  await adminLog(`🏀 ضبط نسب ${body?.market || "الكل"} للمباراة ${params.id}`);
-  return bbDetail(out, cfg.settings);
-});
-route("POST", "/api/admin/basket/auto-prices", { admin: true, sync: false }, async () => {
-  let n = 0;
-  await bMutate((ms) => ms.map((x) => { if (x.manualRates || x.sOv) { n++; return { ...x, manualRates: null, sOv: null }; } return x; }));
-  await adminLog(`🏀 إعادة ${n} مباراة سلة للتسعير التلقائي`);
-  return { ok: true, count: n };
-});
-route("POST", "/api/admin/basket/flags", { admin: true, sync: false }, async ({ body }) => {
-  const flag = body?.flag;
-  if (!["suspended", "frozen", "hot"].includes(flag)) throw bad("علم غير صالح");
-  const value = !!body.value;
-  await bMutate((ms) => ms.map((m) => (m.status === "ended" ? m : { ...m, [flag]: value })));
-  await adminLog(`🏀 ${flag} = ${value} لكل مباريات السلة`);
-  return { ok: true };
-});
-route("POST", "/api/admin/basket/sync", { admin: true, sync: false }, async ({ cfg }) => {
-  const r = await bSyncReal(cfg, true);
-  const st = await bLoad();
-  await adminLog("🏀 تحديث مباريات السلة الحقيقية يدوياً");
-  return { ok: true, ...r, hasKey: !!bbKey(), real: st.matches.filter((m) => m.real).length, live: st.matches.filter((m) => m.real && m.status === "live").length };
-});
-route("POST", "/api/admin/basket/reset", { admin: true, sync: false }, async () => {
-  const { bets } = await C();
-  const st = await bLoad();
-  const gone = new Set(st.matches.filter((m) => !m.real).map((m) => m.id));
-  let refunded = 0;
-  for (const b of await bets.find({ status: "open", sport: "basketball" }).toArray()) if (gone.has(b.matchId) && (await bRefund(b, "إعادة ضبط المباريات"))) refunded++;
-  await bMutate((ms) => [...ms.filter((m) => m.real), ...BB_FIXTURES.map((f, i) => buildBbMatch(f, i))]);
-  await adminLog("🏀 إعادة مباريات السلة التجريبية للافتراضي");
-  return { ok: true, refunded };
-});
-route("POST", "/api/admin/basket/end-live", { admin: true, sync: false }, async () => {
-  const ended = new Set();
-  const ms = await bMutate((arr) => { ended.clear(); return arr.map((m) => (m.status === "live" && !m.real ? (ended.add(m.id), { ...m, status: "ended", endedAt: Date.now(), minute: m.len }) : m)); });
-  const ev = ended.size ? await bSettle(ended, ms) : [];
-  await adminLog(`🏀 إنهاء ${ended.size} مباراة سلة مباشرة وتسوية`);
-  return { ok: true, ended: ended.size, settled: ev.length };
-});
-
-
 /* ============================ طبقة HTTP ============================ */
 const CORS = {
   "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
@@ -2795,8 +2268,18 @@ function serveStatic(req, res, pathname) {
  */
 const FB_HOST = (process.env.API_FOOTBALL_HOST || "https://v3.football.api-sports.io").replace(/\/+$/, "");
 const fbKey = () => process.env.API_FOOTBALL_KEY || process.env.APISPORTS_KEY || "";
-const FB_LEAGUES = (process.env.FOOTBALL_LEAGUES || "39,140").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x));
+/* الدوريات: افتراضياً كل دوريات وكؤوس العالم. لحصرها ضع FOOTBALL_LEAGUES=39,140,135 ... */
+const FB_LEAGUES = (process.env.FOOTBALL_LEAGUES || "").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x));
 const FB_LEAGUE_SET = new Set(FB_LEAGUES);
+const FB_ALL_LEAGUES = FB_LEAGUES.length === 0;
+const fbLeagueOk = (id) => FB_ALL_LEAGUES || FB_LEAGUE_SET.has(String(id));
+const FB_DAYS_AHEAD = Math.min(14, Math.max(1, Number(process.env.FOOTBALL_DAYS_AHEAD) || 7));
+const FB_MAX_PER_DAY = Math.max(10, Number(process.env.FOOTBALL_MAX_PER_DAY) || 100);
+const FB_MIN_PER_DAY = Math.max(1, Number(process.env.FOOTBALL_MIN_PER_DAY) || 6);
+/* أولوية الدوريات عند تجاوز حد اليوم (الأهم أولاً): كؤوس أوروبا والعالم والدوريات الكبرى ثم العربية والبقية */
+const FB_PRIORITY = [2, 3, 848, 1, 4, 5, 6, 9, 10, 15, 29, 30, 31, 32, 34, 39, 140, 135, 78, 61, 45, 143, 48, 81, 137, 66, 307, 233, 235, 12, 13, 11, 16, 17, 21, 22, 531, 88, 94, 144, 179, 203, 253, 262, 71, 128, 98, 169, 188, 292, 301, 305, 308, 332].map(String);
+const fbPrio = (id) => { const i = FB_PRIORITY.indexOf(String(id)); return i < 0 ? 999 : i; };
+const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
 const FB_ORIGINS = (process.env.FOOTBALL_ALLOWED_ORIGINS || "").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean);
 const FB_UPSTREAM_PER_MIN = Math.max(1, Number(process.env.FOOTBALL_UPSTREAM_PER_MIN) || 10);
 const FB_IP_PER_MIN = Math.max(10, Number(process.env.FOOTBALL_IP_PER_MIN) || 120);
@@ -2849,10 +2332,10 @@ function fbOriginAllowed(req) {
   return true;
 }
 const fbHasErrors = (j) => { const e = j?.errors; return Array.isArray(e) ? e.length > 0 : !!e && typeof e === "object" && Object.keys(e).length > 0; };
-/* حصر النتائج في الدوريات المسموحة (الدوري الإنجليزي والإسباني) */
+/* حصر النتائج في الدوريات المسموحة (الافتراضي: كل الدوريات) */
 function fbFilterLeagues(endpoint, json) {
   if (!["fixtures", "leagues", "standings"].includes(endpoint) || !Array.isArray(json?.response)) return json;
-  const response = json.response.filter((it) => FB_LEAGUE_SET.has(String(it?.league?.id)));
+  const response = json.response.filter((it) => fbLeagueOk(it?.league?.id));
   return { ...json, response, results: response.length };
 }
 async function fbUpstream(endpoint, qs) {
@@ -2927,13 +2410,13 @@ async function footballProxy(req, res, url, pathname) {
     }
     /* حصر الدوريات */
     const leagueTokens = (v) => String(v).split(/[-,]/).filter(Boolean);
-    if (params.has("league") && !leagueTokens(params.get("league")).every((t) => FB_LEAGUE_SET.has(t)))
+    if (params.has("league") && !leagueTokens(params.get("league")).every((t) => fbLeagueOk(t)))
       return fbSend(res, 403, fbEnvelope(sub, { league: "دوري غير مسموح" }));
     if (sub === "standings" && !params.has("league")) return fbSend(res, 403, fbEnvelope(sub, { league: "league مطلوب" }));
     if (sub === "fixtures" && params.has("live")) {
       const lv = params.get("live");
-      if (lv === "all") params.set("live", FB_LEAGUES.join("-"));
-      else if (!leagueTokens(lv).every((t) => FB_LEAGUE_SET.has(t))) return fbSend(res, 403, fbEnvelope(sub, { live: "دوري غير مسموح" }));
+      if (lv === "all") params.set("live", FB_ALL_LEAGUES ? "all" : FB_LEAGUES.join("-"));
+      else if (lv !== "all" && !leagueTokens(lv).every((t) => fbLeagueOk(t))) return fbSend(res, 403, fbEnvelope(sub, { live: "دوري غير مسموح" }));
     }
     params.sort();
     const qs = params.toString();
