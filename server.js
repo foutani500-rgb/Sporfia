@@ -1208,15 +1208,23 @@ route("POST", "/api/wallet/withdraw", async ({ user, body, cfg }) => {
   assertActive(user, cfg);
   const s = cfg.settings;
   if (!s.withdrawalsEnabled) throw forbid("السحب متوقف حالياً");
-  const amount = Number(body.amount);
+  const amount = r2(Number(body.amount));   // تقريب لسنتين (يمنع الكسور العشرية الطويلة)
   const m = cfg.payments.find((p) => p.id === body.method);
   if (!m) throw bad("طريقة دفع غير معروفة");
+  if (!m.enabled) throw bad("طريقة الدفع هذه متوقفة حالياً");
   if (!Number.isFinite(amount) || amount <= 0) throw bad("أدخل مبلغاً صحيحاً");
+  // وجهة التحويل: عنوان محفظة (USDT) أو معرّف Binance — إلزامية وتُحفظ مع الحركة ليراها الأدمن
+  const clean = (v, max = 120) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+  const dest = { kind: clean(body.kind, 20) || null, network: clean(body.network, 30) || null, address: clean(body.address), binanceId: clean(body.binanceId, 40) };
+  if (!dest.address && !dest.binanceId) throw bad("أدخل عنوان المحفظة أو معرّف Binance");
+  if (dest.address && /trc/i.test(dest.network || "") && !/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(dest.address)) throw bad("عنوان TRC20 غير صالح");
+  if (dest.binanceId && !/^[0-9A-Za-z@._-]{3,40}$/.test(dest.binanceId)) throw bad("معرّف Binance غير صالح");
+  const destText = dest.address ? `${dest.network ? dest.network + ": " : ""}${dest.address}` : `Binance ID: ${dest.binanceId}`;
   if (amount < s.minWithdraw) throw bad(`أدنى مبلغ للسحب هو $${s.minWithdraw}`);
   if (s.maxWithdraw > 0 && amount > s.maxWithdraw) throw bad(`أقصى مبلغ للسحب $${s.maxWithdraw}`);
   const u = await debit(user._id, amount);
   if (!u) throw bad("المبلغ يتجاوز رصيدك المتاح");
-  const tx = await addTx(user._id, { kind: "withdraw", amount: -amount, label: `سحب عبر ${m.name}`, method: m.id, status: s.withdrawAutoApprove ? "done" : "pending" });
+  const tx = await addTx(user._id, { kind: "withdraw", amount: -amount, label: `سحب عبر ${m.name} ← ${destText}`, method: m.id, dest, status: s.withdrawAutoApprove ? "done" : "pending" });
   await addNotice(user._id, { title: "🏦 طلب سحب قيد المعالجة", body: `$${amount} عبر ${m.name} — الوصول خلال ${m.eta}.`, tone: "info" });
   return { ok: true, tx: pub(tx), balance: r2(u.balance) };
 });
@@ -1266,7 +1274,7 @@ route("GET", "/api/bets", async ({ user, query, cfg, matches }) => {
 });
 route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   assertActive(user, cfg);
-  const s = cfg.settings, stake = Number(body.stake);
+  const s = cfg.settings, stake = r2(Number(body.stake));   // تقريب لسنتين
   const market = body.market === "result" ? "result" : "exact";
   const optIndex = market === "result"
     ? (body.optIndex !== undefined ? Number(body.optIndex) : RES_PICKS.indexOf(String(body.pick).toUpperCase()))
@@ -1293,9 +1301,11 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   if (user.limits.selfExcludedUntil && Date.now() < user.limits.selfExcludedUntil) throw forbid("أنت في فترة إيقاف ذاتي");
   const { bets, refs } = await C();
   if (user.limits.dailyLossLimit > 0) {
-    const since = new Date().setHours(0, 0, 0, 0);
-    const today = await bets.find({ userId: user._id, status: "lost", compensated: { $ne: true }, createdAt: { $gte: since } }).toArray();
-    if (today.reduce((a, b) => a + b.stake, 0) >= user.limits.dailyLossLimit) throw forbid("بلغت حد الخسارة اليومي");
+    // نافذة متحرّكة آخر 24 ساعة (لا تعتمد على منطقة الخادم الزمنية) — تُحسب الخسائر + الرهانات المفتوحة + هذا الرهان
+    const since = Date.now() - 24 * 3600_000;
+    const recent = await bets.find({ userId: user._id, status: { $in: ["lost", "open"] }, compensated: { $ne: true }, createdAt: { $gte: since } }).toArray();
+    const exposure = recent.reduce((a, b) => a + b.stake, 0);
+    if (exposure + stake > user.limits.dailyLossLimit + 1e-9) throw forbid(`هذا الرهان يتجاوز حد الخسارة اليومي ($${user.limits.dailyLossLimit}) — المتبقي $${Math.max(0, r2(user.limits.dailyLossLimit - exposure))}`);
   }
   // 1) خصم ذرّي  2) إضافة للمجمّع بسعر لحظي  3) تسجيل الرهان — وإن فشلت خطوة نُعيد المبلغ
   const after = await debit(user._id, stake);
@@ -1327,8 +1337,21 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
     _id: uid(), userId: user._id, matchId: m0.id, matchLabel, market, pick: market === "result" ? RES_PICKS[optIndex] : SCORES[optIndex], optIndex, stake, odds,
     status: "open", payout: 0, createdAt: Date.now(), streakBonus: streakBonus(user.streak || 0),
   };
-  await bets.insertOne(bet);
-  await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${pickText(bet, m0)}` });
+  try {
+    await bets.insertOne(bet);
+  } catch (e) {
+    // فشل التسجيل بعد الخصم وتحديث المجمّع: نعيد المبلغ ونتراجع عن إضافته للمجمّع
+    await credit(user._id, stake).catch(() => undefined);
+    await mutateState((ms) => ms.map((m) => {
+      if (m.id !== m0.id) return m;
+      if (market === "result") { const rp = rPoolsOf(m).slice(); rp[optIndex] = Math.max(1, rp[optIndex] - stake); return { ...m, rPools: rp }; }
+      const pools = m.pools.slice(); pools[optIndex] = Math.max(1, pools[optIndex] - stake);
+      return withOdds(m, pools);
+    })).catch(() => undefined);
+    throw new HttpError(500, "تعذّر تسجيل الرهان — أُعيد مبلغك كاملاً، حاول مجدداً");
+  }
+  // سجل الحركات ثانوي: فشله لا يجب أن يُظهر خطأً بعد أن سُجّل الرهان فعلاً
+  await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${pickText(bet, m0)}` }).catch(() => undefined);
   if (user.referredBy && s.commissionEnabled) {
     // العمولة 3 مستويات (10% / 5% / 3% من مبلغ الرهان) ولا تُفعَّل إلا بعد «التأهيل»:
     // استلام المدعو مكافأة الدعوة (5$) من الإدارة، وتُحتسب على رهاناته اللاحقة فقط — بلا أثر رجعي
@@ -1658,7 +1681,9 @@ async function findTx(id) {
 }
 route("POST", "/api/admin/transactions/:id/approve", A, async ({ params }) => {
   const tx = await findTx(params.id);
-  const out = await fau((await C()).txs, { _id: tx._id }, { $set: { status: "done" } });
+  // لا يُعتمد إلا ما كان معلّقاً (يمنع اعتماد حركة مرفوضة سبق استرجاع رصيدها)
+  const out = await fau((await C()).txs, { _id: tx._id, status: "pending" }, { $set: { status: "done" } });
+  if (!out) throw bad(tx.status === "rejected" ? "هذه الحركة مرفوضة سابقاً ولا يمكن اعتمادها" : "لا يمكن اعتماد هذه الحركة (ليست معلّقة)");
   await adminLog(`اعتماد حركة ${tx._id}`);
   return pub(out, true);
 });
