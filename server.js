@@ -298,6 +298,7 @@ const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // مكافأ�
 const START_BALANCE = Number(process.env.START_BALANCE ?? 0); // رصيد البداية للمستخدم الجديد: 0$ (يمكن تغييره بمتغير البيئة START_BALANCE)
 const MAX_CATCHUP = 150;                 // أقصى عدد نبضات تُحسب في طلب واحد
 const ENDED_KEEP_MS = 15 * 60_000;       // المباراة المنتهية تُستبدل بجديدة بعد 15 دقيقة
+const MANUAL_ENDED_KEEP_MS = 3 * 3600_000; // مباراة الأدمن المنتهية تبقى ظاهرة 3 ساعات (لتظهر نتيجتها) ثم تُزال
 
 const DEFAULT_PAYMENTS = [
   { id: "card", name: "بطاقة بنكية", emoji: "💳", note: "Visa · Mastercard · مدى", minDeposit: 10, maxDeposit: 5000, feePct: 0, eta: "فوري", enabled: true },
@@ -681,12 +682,49 @@ async function ensureDailyMin() {
   if (!adds.length) return;
   await mutateState((arr) => { const ids = new Set(arr.map((m) => m.id)); return [...arr, ...adds.filter((m) => !ids.has(m.id))]; });
 }
+/* ===== مباريات الأدمن اليدوية: الأدمن يحدد startsAt (البدء) و endsAt (الانتهاء) والسيرفر ينفّذ ذلك بالضبط =====
+ *  - upcoming → live عند startsAt.   - live → ended عند endsAt (بنتيجة finalScore إن وُضعت وإلا النتيجة الحالية) وتُسوّى الرهانات تلقائياً.
+ *  - بلا endsAt: تبقى حيّة حتى ينهيها الأدمن يدوياً (زر إنهاء).  - الدقيقة تُحسب من الزمن المنقضي ولا تُخزَّن (لا كتابات متكررة). */
+const manualNeedsStep = (m, now) => m.manual && m.status !== "ended" && ((m.status === "upcoming" && m.startsAt <= now) || (m.status === "live" && m.endsAt && now >= m.endsAt));
+const manualStep = (m, now) => {
+  if (!m.manual || m.status === "ended") return m;
+  let n = m;
+  if (n.status === "upcoming" && n.startsAt <= now) n = { ...n, status: "live", minute: 1 };
+  if (n.status === "live" && n.endsAt && now >= n.endsAt) {
+    const fs = Array.isArray(m.finalScore) && m.finalScore.length === 2 ? m.finalScore.map((x) => Math.max(0, Math.floor(Number(x)) || 0)) : n.score;
+    n = { ...n, status: "ended", minute: 90, score: fs, endedAt: now };
+  }
+  return n;
+};
+const manualMinute = (m, now) => {
+  if (!m.manual || m.status !== "live") return m;
+  const span = m.endsAt && m.endsAt > m.startsAt ? m.endsAt - m.startsAt : 90 * 60_000;
+  return { ...m, minute: Math.max(1, Math.min(89, Math.floor(((now - m.startsAt) / span) * 90))) };
+};
+async function syncManual() {
+  const st = await loadState();
+  const now = Date.now();
+  let ms = st.matches;
+  if (ms.some((m) => manualNeedsStep(m, now))) {
+    const ended = new Set();
+    ms = await mutateState((arr) => {
+      ended.clear();
+      const t = Date.now();
+      return arr.map((m) => { const n = manualStep(m, t); if (m.status !== "ended" && n.status === "ended") ended.add(m.id); return n; });
+    });
+    if (ended.size) await settleBets(ended, ms).catch((e) => console.error("settle manual:", e));
+  }
+  return ms;
+}
 /** يلحق المباريات بالوقت الحقيقي ويسوّي الرهانات للمباريات المنتهية */
 /** إزالة المباريات الحية (والتجريبية التي كانت ستصير حية) مع استرداد رهاناتها المفتوحة — تعمل فقط عند وجود ما يُزال */
 async function purgeLive() {
   const st = await loadState();
   const now = Date.now();
-  const drop = (m) => m.status === "live" || (!m.real && m.status === "upcoming" && m.startsAt <= now) || (m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS);
+  /* مباريات الأدمن اليدوية (manual) لا تُحذف أبداً بسبب بدئها أو كونها حيّة — يتحكّم الأدمن بوقت بدئها وانتهائها. تُزال فقط بعد انتهائها بمدة (MANUAL_ENDED_KEEP_MS) */
+  const drop = (m) => m.manual
+    ? (m.status === "ended" && m.endedAt && now - m.endedAt > MANUAL_ENDED_KEEP_MS)
+    : (m.status === "live" || (!m.real && m.status === "upcoming" && m.startsAt <= now) || (m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS));
   const gone = st.matches.filter(drop);
   if (!gone.length) return st.matches;
   const ids = gone.map((m) => m.id);
@@ -698,7 +736,10 @@ async function syncMatches() {
   const cfg = await getConfig();
   await syncReal(cfg).catch((e) => console.error("syncReal:", e?.message || e));
   await ensureDailyMin().catch((e) => console.error("ensureDailyMin:", e?.message || e));
-  return await purgeLive();   // ⛔ المحاكاة والمباريات الحية معطّلة: لا نبضات ولا كتابات متكررة
+  await syncManual().catch((e) => console.error("syncManual:", e?.message || e));   // مباريات الأدمن: بدء/إنهاء/تسوية بتوقيته
+  const out = await purgeLive();   // ⛔ المحاكاة والمباريات الحية الآلية معطّلة: لا نبضات ولا كتابات متكررة
+  const tnow = Date.now();
+  return out.map((m) => manualMinute(m, tnow));
   // eslint-disable-next-line no-unreachable
   const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
   const { state } = await C();
@@ -817,6 +858,8 @@ const matchView = (m) => {
     chances: rt.probs.exact.map((x) => +x.toFixed(4)), rChances: rt.probs.res.map((x) => +x.toFixed(4)),
     dead: live ? deadOf(m) : null, suspendUntil: m.suspendUntil || 0,
     manualRates: m.manualRates || null,
+    manual: !!m.manual, endsAt: m.endsAt || 0, serverNow: Date.now(),
+    isReal: !!(m.real || m.manual),   // لا وسم «تجريبية»: مباريات الأدمن حقيقية
   };
 };
 const withOdds = (m, pools) => ({
@@ -976,7 +1019,7 @@ route("GET", "/api/vip/tiers", PUBLIC_R, ({ cfg }) => cfg.vipTiers);
 
 /* ---- المباريات ---- */
 route("GET", "/api/matches", PUBLIC_R, ({ query, matches, cfg }) => {
-  let list = cfg.settings.showSimMatches === false ? matches.filter((m) => m.real) : matches;
+  let list = cfg.settings.showSimMatches === false ? matches.filter((m) => m.real || m.manual) : matches;   // مباريات الأدمن تظهر دائماً
   if (query.league) list = list.filter((m) => m.leagueId === query.league);
   if (query.status) list = list.filter((m) => m.status === query.status);
   if (query.hot === "1") list = list.filter((m) => m.hot);
@@ -988,7 +1031,7 @@ route("GET", "/api/ticker", PUBLIC_R, ({ matches }) => ({
   matches: matches.map((m) => {
     const rt = ratesOf(m);
     return {
-      id: m.id, status: m.status, minute: m.minute, score: m.score,
+      id: m.id, status: m.status, minute: m.minute, score: m.score, startsAt: m.startsAt, endsAt: m.endsAt || 0, serverNow: Date.now(),
       rates: rt.exact, rRates: rt.res,   // rRates = نسب فوز الفريقين/التعادل (كانت مفقودة فلا تتحدّث في الواجهة)
       manualRates: m.manualRates || null, totalPool: Math.round(totalPool(m.pools)),
     };
@@ -1807,20 +1850,34 @@ const cleanLogo = (u) => { const v = typeof u === "string" ? u.trim() : ""; retu
 const cleanTeam = (t) => (t && typeof t === "object" ? { ...t, logo: cleanLogo(t.logo) } : t);
 route("POST", "/api/admin/matches", A, async ({ body }) => {
   for (const k of ["leagueId", "home", "away"]) if (!body?.[k]) throw bad(`الحقل ${k} مطلوب`);
-  const id = `m${Date.now().toString(36)}`;
+  const id = `m${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
   const team = (t) => (typeof t === "string" ? { name: t, short: t.slice(0, 3).toUpperCase(), colors: ["#1a6ef0", "#0b3a8f"] } : cleanTeam(t));
-  const startsAt = body.startsAt ? Number(body.startsAt) : Date.now() + (Number(body.inMinutes) || 60) * 60000;
+  const now = Date.now();
   const live = !!body.live, minute = live ? Math.min(89, Math.max(1, Number(body.minute) || 1)) : 0;
   const bias = Math.min(2, Math.max(0.5, Number(body.bias) || 1.05));
+  /* التوقيت: الأدمن يحدد البدء (startsAt بالميلي ثانية أو inMinutes) والانتهاء (endsAt أو durationMin بعد البدء) */
+  const durMs = Number(body.durationMin) > 0 ? Math.round(Number(body.durationMin) * 60000) : 0;
+  let startsAt = body.startsAt ? Number(body.startsAt) : now + (Number.isFinite(Number(body.inMinutes)) && body.inMinutes !== undefined && body.inMinutes !== "" ? Number(body.inMinutes) : 60) * 60000;
+  let endsAt = body.endsAt ? Number(body.endsAt) : 0;
+  if (live) {
+    /* مباراة جارية الآن عند الدقيقة minute: نضبط startsAt بحيث تنتهي في endsAt بالضبط (أو بعد durationMin من بدايتها) */
+    if (endsAt > now) startsAt = Math.round((90 * now - minute * endsAt) / (90 - minute));
+    else startsAt = durMs ? now - Math.round((minute / 90) * durMs) : now - minute * 60000;
+  }
+  if (!Number.isFinite(startsAt)) throw bad("وقت البدء غير صالح");
+  if (!endsAt && durMs) endsAt = startsAt + durMs;
+  if (endsAt && (!Number.isFinite(endsAt) || endsAt <= startsAt)) throw bad("وقت الانتهاء يجب أن يكون بعد وقت البدء");
+  if (endsAt && endsAt <= now && !body.allowPast) throw bad("وقت الانتهاء في الماضي");
   const tpl = buildMatch({ league: body.leagueId, home: team(body.home), away: team(body.away), inMinutes: live ? -1 : 60, bias, hot: !!body.hot, boosted: !!body.boosted }, 0);
-  const nm = { ...tpl, id, leagueId: body.leagueId, home: team(body.home), away: team(body.away), startsAt: live ? Date.now() - minute * 60000 : startsAt, status: live ? "live" : "upcoming", minute, score: [0, 0], hot: !!body.hot, boosted: !!body.boosted };
+  const nm = { ...tpl, id, leagueId: body.leagueId, home: team(body.home), away: team(body.away), startsAt, endsAt: endsAt || 0, status: live ? "live" : "upcoming", minute: live ? minute : 0, score: [0, 0], hot: !!body.hot, boosted: !!body.boosted, manual: true, real: false };
+  if (Array.isArray(body.finalScore) && body.finalScore.length === 2) nm.finalScore = body.finalScore.map((x) => Math.max(0, Math.floor(Number(x)) || 0));
   if (body.feePct !== undefined && body.feePct !== null && body.feePct !== "") nm.feePct = clampFeePct(body.feePct); // نسبة خاصة بهذه المباراة (وإلا تُستعمل العامة)
   await mutateState((ms) => [...ms, nm]);
   await adminLog(`إضافة مباراة ${id}`);
   return matchView(nm);
 });
 route("PATCH", "/api/admin/matches/:id", A, async ({ params, body }) => {
-  const allowed = ["hot", "boosted", "suspended", "frozen", "startsAt", "leagueId", "home", "away", "minute", "score", "status", "feePct"];
+  const allowed = ["hot", "boosted", "suspended", "frozen", "startsAt", "leagueId", "home", "away", "minute", "score", "status", "feePct", "endsAt", "finalScore"];
   let out;
   await mutateState((ms) => {
     if (!findMatch(ms, params.id)) throw notFound("المباراة غير موجودة");
