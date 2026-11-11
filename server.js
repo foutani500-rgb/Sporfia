@@ -1082,7 +1082,7 @@ async function sendWelcome(chatId) {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'اضغط هنا لتبدأ الربح 📈', web_app: { url: 'https://exquisite-sorbet-b586b5.netlify.app/' } }], // زر فتح التطبيق بالرابط المباشر والنص الجديد
-        [{ text: '💎 اشترك في قناتنا', url: 'https://t.me/aporfachannel' }],                  // رابط القناة
+        [{ text: '💎 اشترك في قناتنا', url: 'https://t.me/sporfachannel' }],                  // رابط القناة
         [{ text: '👥 انضم لمجموعتنا', url: 'https://t.me/sporfaa' }],         // رابط المجموعة
       ],
     },
