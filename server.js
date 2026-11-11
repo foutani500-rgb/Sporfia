@@ -252,7 +252,7 @@ function tickMatches(matches) {
             });
             // تحديث تاريخ الأسعار للرسم البياني
             const odds = pools.map((_, i) => oddsOf(pools, i, m.boosted, feeOf(m)));
-            const oddsHistory = m.oddsHistory.map((hist, i) => [...hist.slice(-59), +odds[i].toFixed(3)]);
+            const oddsHistory = m.oddsHistory.map((hist, i) => [...hist.slice(-19), +odds[i].toFixed(3)]);
             return { ...m, minute, score, pools, oddsHistory };
         }
         return m;
@@ -268,7 +268,7 @@ function driftUpcoming(matches) {
         const pools = m.pools.slice();
         pools[i] = Math.max(3, Math.round(pools[i] * (0.97 + Math.random() * 0.08)));
         const odds = pools.map((_, k) => oddsOf(pools, k, m.boosted, feeOf(m)));
-        const oddsHistory = m.oddsHistory.map((hist, k) => (k === i ? [...hist.slice(-59), +odds[k].toFixed(3)] : hist));
+        const oddsHistory = m.oddsHistory.map((hist, k) => (k === i ? [...hist.slice(-19), +odds[k].toFixed(3)] : hist));
         return { ...m, pools, oddsHistory };
     });
 }
@@ -573,7 +573,7 @@ async function syncReal(cfg, force = false) {
   if (s.realMatchesEnabled === false || !fbKey() || (s.simPaused && !force)) return { skipped: true };
   const { state } = await C();
   const now = Date.now();
-  const gap = force ? 0 : Math.max(10, Number(s.realSyncSec) || 10) * 1000;
+  const gap = force ? 0 : Math.max(30, Number(s.realSyncSec) || 30) * 1000;
   const claim = await state.updateOne({ _id: "matches", $or: [{ realAt: { $lt: now - gap } }, { realAt: { $exists: false } }] }, { $set: { realAt: now } });
   if (claim.modifiedCount !== 1) return { skipped: true };
   const st = await loadState();
@@ -645,6 +645,12 @@ async function syncReal(cfg, force = false) {
 }
 /** يضمن ألا ينزل أي يوم من الأسبوع القادم عن FOOTBALL_MIN_PER_DAY مباريات: يكمّله بمباريات تجريبية من قائمة الساحة */
 async function ensureDailyMin() {
+  const { state: stLock } = await C();
+  const nowLock = Date.now();
+  const lk = await stLock.updateOne(
+    { _id: "matches", $or: [{ ensureAt: { $lt: nowLock - 600_000 } }, { ensureAt: { $exists: false } }] },
+    { $set: { ensureAt: nowLock } });
+  if (lk.modifiedCount !== 1) return;   // نسخة أخرى فحصت قبل أقل من 10 دقائق
   const st = await loadState();
   const cfg0 = await getConfig();
   /* لا تُكمِّل قبل أن يُجرَّب جلب المباريات الحقيقية (نجح أو فشل). إن كان الجلب معطّلاً/بلا مفتاح/فاشلاً (حد يومي منتهٍ) تُكمَّل مباشرة حتى لا تبقى القائمة فارغة */
@@ -677,7 +683,7 @@ async function syncMatches() {
   await ensureDailyMin().catch((e) => console.error("ensureDailyMin:", e?.message || e));
   const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
   const { state } = await C();
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 1; attempt++) {
     const st = await loadState();
     const now = Date.now();
     if (cfg.settings.simPaused) {
@@ -796,7 +802,7 @@ const matchView = (m) => {
 };
 const withOdds = (m, pools) => ({
   ...m, pools,
-  oddsHistory: m.oddsHistory.map((h, i) => [...h.slice(-59), +oddsOf(pools, i, m.boosted, feeOf(m)).toFixed(3)]),
+  oddsHistory: m.oddsHistory.map((h, i) => [...h.slice(-19), +oddsOf(pools, i, m.boosted, feeOf(m)).toFixed(3)]),
 });
 const findMatch = (ms, id) => ms.find((m) => m.id === id);
 
@@ -1249,7 +1255,7 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
       }
       odds = oddsFromRate(ratesOf(m).exact[optIndex]);
       const pools = m.pools.slice(); pools[optIndex] += stake;
-      return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-59), +odds.toFixed(3)] : h)) } : x));
+      return ms.map((x) => (x.id === m.id ? { ...x, pools, oddsHistory: x.oddsHistory.map((h, i) => (i === optIndex ? [...h.slice(-19), +odds.toFixed(3)] : h)) } : x));
     });
   } catch (e) {
     await credit(user._id, stake);
@@ -2459,6 +2465,12 @@ async function footballProxy(req, res, url, pathname) {
   }
 }
 
+/* مسارات GET لا تستعمل بيانات المباريات: لا نقرأ ولا نكتب وثيقة المباريات لها */
+const NO_MATCH_PATHS = new Set([
+  "/api/me", "/api/notices", "/api/referrals", "/api/referrals/link", "/api/friends", "/api/history",
+  "/api/wallet", "/api/wallet/transactions", "/api/leaderboard", "/api/vip", "/api/bonus/daily",
+]);
+
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -2490,7 +2502,12 @@ export default async function handler(req, res) {
         }
         if (ctx.cfg.settings.maintenance && req.method !== "GET") throw new HttpError(503, ctx.cfg.settings.maintenanceMsg);
       }
-      if (r.sync !== false) ctx.matches = await syncMatches();
+      if (r.sync !== false) {
+        const p = pathname.replace(/\/$/, "");
+        if (req.method === "GET" && NO_MATCH_PATHS.has(p)) ctx.matches = [];
+        else if (req.method === "GET" && p === "/api/bets") ctx.matches = (await loadState()).matches;   // قراءة فقط بلا كتابة
+        else ctx.matches = await syncMatches();
+      }
       if (req.method !== "GET" && req.method !== "DELETE") ctx.body = (await readBody(req)) || {};
       const out = await r.handler(ctx);
       return sendJson(res, 200, out === undefined ? { ok: true } : out);
