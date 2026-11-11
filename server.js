@@ -382,6 +382,9 @@ async function getDb() {
         db.collection("refs").createIndex({ inviterId: 1 }),
         db.collection("refs").createIndex({ userId: 1 }, { unique: true }),
         db.collection("users").createIndex({ balance: -1 }),
+        db.collection("users").createIndex({ lastSeenAt: -1 }),
+        db.collection("bets").createIndex({ createdAt: -1 }),
+        db.collection("txs").createIndex({ kind: 1, status: 1, at: -1 }),
         // الإيداع: مبلغ فريد لكل طلب معلّق، وTXID لا يُعتمد إلا مرة واحدة (حماية من التكرار)
         db.collection("deposits").createIndex({ userId: 1, createdAt: -1 }),
         db.collection("deposits").createIndex({ units: 1 }, { unique: true, partialFilterExpression: { status: "pending" } }),
@@ -618,12 +621,12 @@ async function syncReal(cfg, force = false) {
     for (const p of parsed) {
       const i = idx.get(p.id);
       if (i === undefined) {
-        if (p.status === "ended" || p.status === "void") continue;
+        if (p.status === "ended" || p.status === "void" || p.status === "live") continue;
         out.push(newRealMatch(p)); idx.set(p.id, out.length - 1); continue;
       }
       const m = out[i];
       if (!m.real || m.status === "ended") continue;
-      if (p.status === "void") { voided.add(m.id); continue; }
+      if (p.status === "void" || p.status === "live") { voided.add(m.id); continue; }
       const next = { ...m, apiStatus: p.apiStatus, status: p.status, minute: p.minute, startsAt: p.startsAt, round: p.round,
         home: { ...m.home, logo: p.home.logo }, away: { ...m.away, logo: p.away.logo } };
       if (p.status === "live" || p.status === "ended") {
@@ -645,6 +648,8 @@ async function syncReal(cfg, force = false) {
 }
 /** يضمن ألا ينزل أي يوم من الأسبوع القادم عن FOOTBALL_MIN_PER_DAY مباريات: يكمّله بمباريات تجريبية من قائمة الساحة */
 async function ensureDailyMin() {
+  return;   // ⛔ معطّل: لا مباريات تجريبية
+  // eslint-disable-next-line no-unreachable
   const { state: stLock } = await C();
   const nowLock = Date.now();
   const lk = await stLock.updateOne(
@@ -677,10 +682,24 @@ async function ensureDailyMin() {
   await mutateState((arr) => { const ids = new Set(arr.map((m) => m.id)); return [...arr, ...adds.filter((m) => !ids.has(m.id))]; });
 }
 /** يلحق المباريات بالوقت الحقيقي ويسوّي الرهانات للمباريات المنتهية */
+/** إزالة المباريات الحية (والتجريبية التي كانت ستصير حية) مع استرداد رهاناتها المفتوحة — تعمل فقط عند وجود ما يُزال */
+async function purgeLive() {
+  const st = await loadState();
+  const now = Date.now();
+  const drop = (m) => m.status === "live" || (!m.real && m.status === "upcoming" && m.startsAt <= now) || (m.status === "ended" && m.endedAt && now - m.endedAt > ENDED_KEEP_MS);
+  const gone = st.matches.filter(drop);
+  if (!gone.length) return st.matches;
+  const ids = gone.map((m) => m.id);
+  const { bets } = await C();
+  for (const b of await bets.find({ status: "open", matchId: { $in: ids } }).toArray()) await refundBet(b, "إزالة المباراة الحية").catch(() => undefined);
+  return mutateState((arr) => arr.filter((m) => !drop(m)));
+}
 async function syncMatches() {
   const cfg = await getConfig();
   await syncReal(cfg).catch((e) => console.error("syncReal:", e?.message || e));
   await ensureDailyMin().catch((e) => console.error("ensureDailyMin:", e?.message || e));
+  return await purgeLive();   // ⛔ المحاكاة والمباريات الحية معطّلة: لا نبضات ولا كتابات متكررة
+  // eslint-disable-next-line no-unreachable
   const speed = Math.max(500, cfg.settings.simSpeedMs || 1600);
   const { state } = await C();
   for (let attempt = 0; attempt < 1; attempt++) {
@@ -1471,17 +1490,25 @@ route("POST", "/api/admin/login", { auth: false, sync: false }, async ({ body })
   throw new HttpError(401, "الرمز غير صحيح");
 });
 const A = { admin: true };
-route("GET", "/api/admin/overview", A, async ({ matches }) => {
-  const { users, bets, txs } = await C();
-  const us = await users.find({}, { projection: { balance: 1, lastSeenAt: 1 } }).limit(50000).toArray();
+route("GET", "/api/admin/overview", A, async () => {
+  const { users, bets, txs, state } = await C();
   const nowTs = Date.now();
-  const bs = await bets.find({}, { projection: { stake: 1, status: 1 } }).limit(100000).toArray();
+  const [uCount, online, active24h, balAgg, openBets, betAgg, mAgg, pendingWithdrawals] = await Promise.all([
+    users.estimatedDocumentCount(),
+    users.countDocuments({ lastSeenAt: { $gte: nowTs - 90_000 } }),
+    users.countDocuments({ lastSeenAt: { $gte: nowTs - 86_400_000 } }),
+    users.aggregate([{ $group: { _id: null, t: { $sum: "$balance" } } }]).toArray(),
+    bets.countDocuments({ status: "open" }),
+    bets.aggregate([{ $group: { _id: null, n: { $sum: 1 }, w: { $sum: "$stake" } } }]).toArray(),
+    state.aggregate([{ $match: { _id: "matches" } }, { $project: { n: { $size: { $ifNull: ["$matches", []] } }, live: { $size: { $filter: { input: { $ifNull: ["$matches", []] }, cond: { $eq: ["$$this.status", "live"] } } } } } }]).toArray(),
+    txs.countDocuments({ kind: "withdraw", status: "pending" }),
+  ]);
   return {
-    users: us.length, online: us.filter((u) => nowTs - (u.lastSeenAt || 0) < 90_000).length, active24h: us.filter((u) => nowTs - (u.lastSeenAt || 0) < 86_400_000).length, serverTime: nowTs,
-    balanceTotal: r2(us.reduce((a, u) => a + u.balance, 0)),
-    openBets: bs.filter((b) => b.status === "open").length, totalBets: bs.length, wagered: r2(bs.reduce((a, b) => a + b.stake, 0)),
-    matches: matches.length, live: matches.filter((m) => m.status === "live").length,
-    pendingWithdrawals: await txs.countDocuments({ kind: "withdraw", status: "pending" }),
+    users: uCount, online, active24h, serverTime: nowTs,
+    balanceTotal: r2(balAgg[0]?.t || 0),
+    openBets, totalBets: betAgg[0]?.n || 0, wagered: r2(betAgg[0]?.w || 0),
+    matches: mAgg[0]?.n || 0, live: mAgg[0]?.live || 0,
+    pendingWithdrawals,
   };
 });
 route("GET", "/api/admin/settings", A, ({ cfg }) => cfg.settings);
@@ -2504,7 +2531,8 @@ export default async function handler(req, res) {
       }
       if (r.sync !== false) {
         const p = pathname.replace(/\/$/, "");
-        if (req.method === "GET" && NO_MATCH_PATHS.has(p)) ctx.matches = [];
+        if (r.admin) ctx.matches = /\/settle$/.test(p) ? (await loadState()).matches : [];
+        else if (req.method === "GET" && NO_MATCH_PATHS.has(p)) ctx.matches = [];
         else if (req.method === "GET" && p === "/api/bets") ctx.matches = (await loadState()).matches;   // قراءة فقط بلا كتابة
         else ctx.matches = await syncMatches();
       }
