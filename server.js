@@ -292,9 +292,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const ADMIN_PIN = process.env.ADMIN_PIN || "123456";
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
 const BOT_USERNAME = process.env.BOT_USERNAME || "Sporfiabot";
-// نسب العمولة على صافي ربح كل رهان فائز: المستوى 1 = 10% ، المستوى 2 = 5% ، المستوى 3 = 3% (قابلة للتعديل عبر REF_RATES="0.10,0.05,0.03")
-const REF_RATES = (process.env.REF_RATES || "0.10,0.05,0.03").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0).concat([0, 0, 0]).slice(0, 3);
-const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // مكافأة الداعي عن كل صديق مؤهَّل (تُمنح مرة واحدة عند التأهيل فقط)
+// لا توجد عمولة على أرباح الرهانات: الداعي يحصل فقط على مكافأة ثابتة عند تفعيل حساب صديقه
+const REF_JOIN_BONUS = Number(process.env.REF_JOIN_BONUS ?? 0.2); // الربح الوحيد من الإحالة: 0.2$ لكل صديق بعد استلامه مكافأة 5$ (مرة واحدة)
 const START_BALANCE = Number(process.env.START_BALANCE ?? 0); // رصيد البداية للمستخدم الجديد: 0$ (يمكن تغييره بمتغير البيئة START_BALANCE)
 const MAX_CATCHUP = 150;                 // أقصى عدد نبضات تُحسب في طلب واحد
 const ENDED_KEEP_MS = 15 * 60_000;       // المباراة المنتهية تُستبدل بجديدة بعد 15 دقيقة
@@ -898,23 +897,6 @@ async function autoDepositCheck(userId) {
   await addTx(userId, { kind: "deposit", amount, label: `إيداع تلقائي عبر ${method.name}`, method: method.id });
   await addNotice(userId, { title: "⚡ تمت التعبئة تلقائياً", body: `رصيدك نزل تحت $${ad.threshold} فأعدنا تعبئته بـ $${amount}.`, tone: "gold" });
 }
-/** عمولة الإحالة 3 مستويات من صافي ربح الرهان الفائز فقط (الدفع − المبلغ المراهن)، وليس من الرصيد ولا من مبلغ الرهان */
-async function payReferralCommission(b, payout) {
-  if (!b.refQualified) return;                          // الإحالة لم تكن مؤهَّلة وقت الرهان
-  const profit = r2(payout - b.stake);                  // صافي الربح
-  if (!(profit > 0)) return;
-  const { refs } = await C();
-  const ref = await refs.findOne({ userId: b.userId });
-  if (!ref) return;
-  const inc = { commissionEarned: r2(profit * REF_RATES[0]) };      // المستوى 1
-  const up1 = await refs.findOne({ userId: ref.inviterId });
-  if (up1) {
-    inc.commissionL2 = r2(profit * REF_RATES[1]);                    // المستوى 2
-    const up2 = await refs.findOne({ userId: up1.inviterId });
-    if (up2) inc.commissionL3 = r2(profit * REF_RATES[2]);           // المستوى 3
-  }
-  await refs.updateOne({ userId: b.userId }, { $inc: inc }).catch((e) => console.error("commission:", e?.message || e));
-}
 /** تسوية رهانات المباريات المنتهية (كل رهان يُحجز ذرّياً فلا يُسوّى مرتين) */
 async function settleBets(endedIds, matches, { userId, onlyBetId } = {}) {
   const { bets, users } = await C();
@@ -939,7 +921,6 @@ async function settleBets(endedIds, matches, { userId, onlyBetId } = {}) {
       });
       await addTx(u._id, { kind: "win", amount: payout, label: `فوز ${b.matchLabel} — ${pickText(b, m)}` });
       await addNotice(u._id, { title: `🏆 فزت $${payout}!`, body: `${b.matchLabel} انتهت ${scoreStr} وتوقّعك ${pickText(b, m)} أصاب!`, tone: "success" });
-      await payReferralCommission(b, payout);
       events.push({ userId: u._id, betId: b._id, status: "won" });
     } else {
       const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "lost", payout: 0, settledAt: Date.now() } });
@@ -1371,12 +1352,10 @@ route("POST", "/api/bets", async ({ user, body, cfg, matches }) => {
   // سجل الحركات ثانوي: فشله لا يجب أن يُظهر خطأً بعد أن سُجّل الرهان فعلاً
   await addTx(user._id, { kind: "bet", amount: -stake, label: `رهان ${matchLabel} — ${pickText(bet, m0)}` }).catch(() => undefined);
   if (user.referredBy && s.commissionEnabled) {
-    // العمولة تُحتسب عند فوز الرهان من صافي الربح فقط (انظر payReferralCommission) — هنا نسجّل فقط حجم الرهان
-    // ونعلّم الرهان إن كانت الإحالة مؤهَّلة الآن (استلام المدعو مكافأة الإدارة) فلا يكون هناك أثر رجعي
+    // لا عمولة على الأرباح — نسجّل فقط حجم الرهان للإحصاء
     const ref = await refs.findOne({ userId: user._id });
     if (ref) {
       const inc = { wagered: stake };
-      if (ref.qualified === true) await bets.updateOne({ _id: bet._id }, { $set: { refQualified: true } });
       await refs.updateOne({ userId: user._id }, { $inc: inc, $set: { active: true } });
     }
   }
@@ -1473,7 +1452,7 @@ async function refsOf(userId) {
     const rows = await refs.find({ inviterId: { $in: parents } }).sort({ joinedAt: -1 }).limit(500).toArray();
     for (const r of rows) {
       const { _id, inviterId, commissionL2, commissionL3, ...rest } = r;
-      const earned = level === 1 ? r.commissionEarned || 0 : level === 2 ? commissionL2 || 0 : commissionL3 || 0;
+      const earned = level === 1 && r.qualified === true ? REF_JOIN_BONUS : 0; // الربح الثابت فقط (يُدفع مباشرة للرصيد)
       out.push({ id: _id, ...rest, level, commissionEarned: r2(earned) });
     }
     parents = rows.map((r) => r.userId);
@@ -1486,22 +1465,14 @@ route("GET", "/api/referrals", async ({ user }) => {
   const code = inviteCodeOf(user._id);
   return {
     code, link: `https://t.me/${BOT_USERNAME}?start=ref_${code}`, referrals: list,
-    totalEarned: earned, claimed: r2(user.claimedCommission || 0), pending: r2(Math.max(0, earned - (user.claimedCommission || 0))),
+    totalEarned: earned, claimed: earned, pending: 0, // المكافأة تُضاف تلقائياً للرصيد عند التفعيل فلا شيء معلّق
   };
 });
 route("GET", "/api/referrals/link", ({ user }) => ({ link: `https://t.me/${BOT_USERNAME}?start=ref_${inviteCodeOf(user._id)}` }));
 route("POST", "/api/referrals/claim", async ({ user, cfg }) => {
   assertActive(user, cfg);
-  if (!cfg.settings.commissionEnabled) throw forbid("العمولة متوقفة");
-  const list = await refsOf(user._id);
-  const claimedBefore = user.claimedCommission || 0;
-  const pending = r2(list.reduce((a, r) => a + r.commissionEarned, 0) - claimedBefore);
-  if (pending <= 0.01) throw bad("لا توجد عمولة متاحة");
-  const { users } = await C();
-  const u = await fau(users, { _id: user._id, claimedCommission: claimedBefore }, { $inc: { balance: pending, claimedCommission: pending } });
-  if (!u) throw bad("تم الاستلام بالفعل، أعد المحاولة");
-  await addTx(user._id, { kind: "commission", amount: pending, label: "عمولة الإحالات" });
-  return { ok: true, amount: pending, balance: r2(u.balance) };
+  // لا عمولة للاستلام: مكافأة الإحالة (0.2$) تُضاف مباشرة للرصيد عند تفعيل حساب الصديق
+  throw bad("لا توجد عمولة متاحة");
 });
 route("GET", "/api/friends", async ({ user }) => {
   const { users } = await C();
@@ -1658,7 +1629,7 @@ route("POST", "/api/admin/users/:id/balance", A, async ({ params, body }) => {
   const u = await fau(users, delta < 0 ? { _id: id, balance: { $gte: -delta } } : { _id: id }, { $inc: { balance: delta } });
   if (!u) throw bad("المستخدم غير موجود أو الرصيد لا يكفي");
   await addTx(id, { kind: delta >= 0 ? "bonus" : "adjust", amount: delta, label: body.note || "تعديل إداري للرصيد" });
-  // تأهيل الإحالة: منح المدعو 5$ بالضبط من الإدارة (مرة واحدة) يفعّل احتساب عمولة صاحب الدعوة من هذه اللحظة
+  // تأهيل الإحالة: منح المدعو 5$ بالضبط من الإدارة (مرة واحدة) يمنح صاحب الدعوة 0.2$ فقط
   if (delta === 5) {
     const q = await fau(refs, { userId: id, qualified: { $ne: true } }, { $set: { qualified: true, qualifiedAt: Date.now() } });
     if (q) {
@@ -1667,7 +1638,7 @@ route("POST", "/api/admin/users/:id/balance", A, async ({ params, body }) => {
         const inv = await credit(q.inviterId, REF_JOIN_BONUS);
         if (inv) await addTx(q.inviterId, { kind: "bonus", amount: REF_JOIN_BONUS, label: `مكافأة إحالة ${u.name}` });
       }
-      await addNotice(q.inviterId, { title: "✅ إحالتك أصبحت مؤهَّلة", body: `${u.name} استلم مكافأة الإدارة، فحصلت على $${REF_JOIN_BONUS} وتُحتسب عمولتك على رهاناته من الآن.`, tone: "success" });
+      await addNotice(q.inviterId, { title: "✅ إحالتك أصبحت مؤهَّلة", body: `${u.name} استلم مكافأة تفعيل الحساب، فحصلت على $${REF_JOIN_BONUS} مكافأة إحالة.`, tone: "success" });
       await adminLog(`تأهيل إحالة: ${id} ← ${q.inviterId}`);
     }
   }
@@ -2090,7 +2061,6 @@ route("POST", "/api/admin/bets/:id/settle", A, async ({ params, body }) => {
     await users.updateOne({ _id: b.userId }, { $inc: { balance: payout, streak: 1, vipXp: Math.round(b.stake) }, $set: { bestStreak: Math.max(u?.bestStreak || 0, (u?.streak || 0) + 1) } });
     await addTx(b.userId, { kind: "win", amount: payout, label: `فوز ${b.matchLabel} — ${b.pick}` });
     await addNotice(b.userId, { title: `🏆 فزت $${payout}!`, body: `${b.matchLabel} — توقّعك ${b.pick} أصاب!`, tone: "success" });
-    await payReferralCommission(b, payout);
   } else if (body?.result === "lost") {
     const claimed = await fau(bets, { _id: b._id, status: "open" }, { $set: { status: "lost", payout: 0, settledAt: Date.now() } });
     if (!claimed) throw bad("الرهان مسوّى بالفعل");
